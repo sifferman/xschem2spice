@@ -16,6 +16,7 @@ jobs:
       git: ${{ github.workspace }}/git
       PDK_ROOT: ${{ github.workspace }}/tools/ciel-pdks
       PDK: sky130A
+      XSCHEM_SHAREDIR: ${{ github.workspace }}/tools/xschem/share/xschem
 
     steps:
       - uses: actions/checkout@v4
@@ -79,3 +80,10 @@ jobs:
       - name: Run tests
         run: |
           make test XSCHEM_EXAMPLES=1
+
+      - name: Upload LVS reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: lvs-reports
+          path: test/reports
+          if-no-files-found: ignore
