@@ -1,3 +1,33 @@
+/*
+ * xschem2spice - a headless C tool that converts xschem .sch/.sym files into SPICE netlists
+ * Copyright (C) 2026 Ethan Sifferman
+ *
+ * Portions of this file are derived from xschem
+ * Copyright (C) 1998-2021 Stefan Frederik Schippers
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, see <https://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Connectivity and SPICE emission mirror XSCHEM 3.4.7's netlisting pipeline:
+ * prepare_netlist_structs():
+ * https://github.com/StefanSchippers/xschem/blob/3.4.7/src/netlist.c#L1509-L1549
+ * spice_netlist() / global_spice_netlist():
+ * https://github.com/StefanSchippers/xschem/blob/3.4.7/src/spice_netlist.c#L171-L249
+ * https://github.com/StefanSchippers/xschem/blob/3.4.7/src/spice_netlist.c#L252-L607
+ */
+
 #include "netlist.h"
 #include "hash.h"
 #include "strutil.h"
@@ -8,1069 +38,1210 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Implemented in parser.c */
-void xs_apply_xform(int rot, int flip, double sx, double sy,
-                    double *gx, double *gy);
+#define NET_LABEL_PRIO_NONE     0
+#define NET_LABEL_PRIO_LAB_PIN  2
+#define NET_LABEL_PRIO_PORT     3
 
-void xs_netlister_init(xs_netlister *nl, xs_libpath *lib, int lvs_mode)
+/* ============================================================ *
+ * Symbol-type predicates and small helpers
+ * ============================================================ */
+
+static int symbol_type_is_port(const char *type)
 {
-    nl->lvs_mode = lvs_mode;
-    nl->flat = 0;
-    nl->lib = lib;
-    nl->sym_cache = (struct xs_hash *)xs_hash_new(64);
+    return type && (!strcmp(type, "ipin") || !strcmp(type, "opin") ||
+                    !strcmp(type, "iopin"));
 }
 
-static void free_symbol_val(void *p)
+static int symbol_type_is_label_or_pin(const char *type)
+{
+    return symbol_type_is_port(type) || (type && !strcmp(type, "label"));
+}
+
+static int symbol_type_equals(const char *type, const char *want)
+{
+    return type && strcmp(type, want) == 0;
+}
+
+/* xschem's strboolcmp accepts "true", "1", "yes" (case-insensitive) plus the
+ * special token "short" for spice_ignore. */
+static int spice_ignore_value_is_truthy(const char *v)
+{
+    return v && (!strcmp(v, "true") || !strcmp(v, "1") ||
+                 !strcmp(v, "yes")  || !strcmp(v, "short"));
+}
+
+static char *symref_basename_without_extension(const char *symref)
+{
+    const char *slash = strrchr(symref, '/');
+    const char *base  = slash ? slash + 1 : symref;
+    size_t len = strlen(base);
+    if (len >= 4 && (!strcmp(base + len - 4, ".sym") ||
+                     !strcmp(base + len - 4, ".sch"))) len -= 4;
+    return xs_strndup(base, len);
+}
+
+/* Look up `key` on the instance, then on the symbol's template default. */
+static char *lookup_property_with_template_fallback(const xs_instance *ins,
+                                                    const char *key)
+{
+    char *v = xs_prop_get(ins->prop_block, key);
+    if (v && *v) return v;
+    free(v);
+    if (ins->resolved_symbol && ins->resolved_symbol->template_) {
+        char *t = xs_prop_get(ins->resolved_symbol->template_, key);
+        if (t) return t;
+    }
+    return xs_strdup("");
+}
+
+/* Trim surrounding whitespace; in lvs_mode also strip a leading `#`
+ * (XSCHEM's auto-name marker). */
+static char *normalize_net_label(const char *raw, int lvs_mode)
+{
+    if (!raw) return NULL;
+    while (*raw == ' ' || *raw == '\t') raw++;
+    if (lvs_mode && *raw == '#') raw++;
+    char *r = xs_strdup(raw);
+    char *e = r + strlen(r);
+    while (e > r && (e[-1] == ' '  || e[-1] == '\t' ||
+                     e[-1] == '\n' || e[-1] == '\r')) e--;
+    *e = '\0';
+    return r;
+}
+
+/* ============================================================ *
+ * Bus designators (e.g. "DATA[3:0]" or "DIN[15..0]")
+ *
+ * Mirrors expansion done by XSCHEM's expandlabel.y:
+ *   strbus           https://github.com/StefanSchippers/xschem/blob/3.4.7/src/expandlabel.y#L199-L218
+ *   strbus_nobracket https://github.com/StefanSchippers/xschem/blob/3.4.7/src/expandlabel.y#L230-L249
+ * ============================================================ */
+
+typedef enum { BUS_NONE = 0, BUS_COLON, BUS_DOTDOT } bus_kind;
+
+typedef struct {
+    bus_kind kind;
+    size_t   base_length;   /* characters before `[` */
+    int      hi, lo;
+    int      multiplicity;
+} bus_designator;
+
+static int parse_bus_designator(const char *s, bus_designator *out)
+{
+    out->kind = BUS_NONE;
+    if (!s) return 0;
+    const char *lb = strchr(s, '[');
+    if (!lb) return 0;
+    int hi, lo;
+    if (sscanf(lb, "[%d..%d]", &hi, &lo) == 2)      out->kind = BUS_DOTDOT;
+    else if (sscanf(lb, "[%d:%d]",  &hi, &lo) == 2) out->kind = BUS_COLON;
+    else return 0;
+    out->base_length  = (size_t)(lb - s);
+    out->hi           = hi;
+    out->lo           = lo;
+    out->multiplicity = (hi >= lo) ? (hi - lo + 1) : (lo - hi + 1);
+    return out->multiplicity;
+}
+
+static void format_bus_scalar(char *buf, size_t bufsz,
+                              const char *base, const bus_designator *d, int bit)
+{
+    if (d->kind == BUS_DOTDOT) {
+        snprintf(buf, bufsz, "%.*s%d",   (int)d->base_length, base, bit);
+    } else {
+        snprintf(buf, bufsz, "%.*s[%d]", (int)d->base_length, base, bit);
+    }
+}
+
+/* ============================================================ *
+ * Symbol resolution and missing.sym placeholder
+ * ============================================================ */
+
+static void free_cached_symbol(void *p)
 {
     if (!p) return;
     xs_free_symbol((xs_symbol *)p);
     free(p);
 }
 
-void xs_netlister_free(xs_netlister *nl)
+/* When a referenced symbol can't be resolved, XSCHEM substitutes
+ * `systemlib/missing.sym` whose format prints `* @name - @symname IS MISSING
+ * !!!!`. We mirror that: see XSCHEM's match_symbol() at
+ *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/token.c#L182-L201
+ * and missing.sym at
+ *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/systemlib/missing.sym
+ */
+static xs_symbol *missing_symbol_placeholder(xs_netlister *nl)
 {
-    if (nl->sym_cache) xs_hash_free((xs_hash *)nl->sym_cache, free_symbol_val);
-    nl->sym_cache = NULL;
+    xs_symbol *cached = xs_hash_get(nl->symbol_cache, "__missing__");
+    if (cached) return cached;
+    xs_symbol *m = xs_xmalloc(sizeof *m);
+    memset(m, 0, sizeof *m);
+    m->name   = xs_strdup("missing");
+    m->path   = xs_strdup("(missing)");
+    m->type   = xs_strdup("missing");
+    m->format = xs_strdup("*  @name -  @symname  IS MISSING !!!!");
+    xs_hash_put(nl->symbol_cache, "__missing__", m);
+    return m;
 }
 
-struct xs_symbol *xs_netlister_self_symbol(xs_netlister *nl,
-                                           const xs_schematic *sch)
+/* Allocate and parse a symbol at `path`. Returns NULL on parse error. */
+static xs_symbol *parse_symbol_or_free(const char *path)
 {
-    /* Build candidate path: same dir as the .sch, basename swap .sch -> .sym */
-    if (!sch->path) return NULL;
-    size_t l = strlen(sch->path);
-    if (l < 4 || strcmp(sch->path + l - 4, ".sch") != 0) return NULL;
-    char *path = xs_strdup(sch->path);
-    memcpy(path + l - 4, ".sym", 4);
-    /* check direct path; fall back to library lookup using just the basename */
-    xs_symbol *sym = NULL;
-    {
-        FILE *f = fopen(path, "r");
-        if (f) {
-            fclose(f);
-            sym = xs_xmalloc(sizeof *sym);
-            if (xs_parse_symbol(path, sym) != 0) {
-                free(sym);
-                sym = NULL;
-            }
-        }
-    }
-    if (!sym) {
-        const char *slash = strrchr(path, '/');
-        const char *base = slash ? slash + 1 : path;
-        char *resolved = xs_libpath_resolve(nl->lib, base);
-        if (resolved) {
-            sym = xs_xmalloc(sizeof *sym);
-            if (xs_parse_symbol(resolved, sym) != 0) {
-                free(sym);
-                sym = NULL;
-            }
-            free(resolved);
-        }
-    }
-    free(path);
-    if (!sym) return NULL;
-    /* Cache so we don't leak — use a sentinel key */
-    char cachekey[512];
-    snprintf(cachekey, sizeof cachekey, "__self__:%s", sch->cell_name);
-    void *prev = xs_hash_put((xs_hash *)nl->sym_cache, cachekey, sym);
-    if (prev) free_symbol_val(prev);
+    xs_symbol *sym = xs_xmalloc(sizeof *sym);
+    if (xs_parse_symbol(path, sym) == 0) return sym;
+    free(sym);
+    return NULL;
+}
+
+/* Try the path verbatim, then fall back to a libpath lookup of its basename. */
+static xs_symbol *parse_symbol_with_libpath_fallback(xs_netlister *nl,
+                                                     const char *direct_path)
+{
+    FILE *probe = fopen(direct_path, "r");
+    if (probe) { fclose(probe); return parse_symbol_or_free(direct_path); }
+
+    const char *slash = strrchr(direct_path, '/');
+    char *resolved = xs_library_path_resolve(nl->library_path,
+                                             slash ? slash + 1 : direct_path);
+    if (!resolved) return NULL;
+    xs_symbol *sym = parse_symbol_or_free(resolved);
+    free(resolved);
     return sym;
+}
+
+/* Load `<schematic>.sym` (the symbol view of the schematic itself), if one
+ * exists. We use its B-record pin order as the .subckt port list because
+ * xschem creates symbols-from-schematics with that as the canonical order. */
+static xs_symbol *load_companion_sym_for_schematic(xs_netlister *nl,
+                                                   const xs_schematic *sch)
+{
+    if (!sch->path) return NULL;
+    size_t len = strlen(sch->path);
+    if (len < 4 || strcmp(sch->path + len - 4, ".sch") != 0) return NULL;
+
+    char *candidate_path = xs_strdup(sch->path);
+    memcpy(candidate_path + len - 4, ".sym", 4);
+    xs_symbol *sym = parse_symbol_with_libpath_fallback(nl, candidate_path);
+    free(candidate_path);
+    if (!sym) return NULL;
+
+    char cache_key[512];
+    snprintf(cache_key, sizeof cache_key, "__self__:%s", sch->cell_name);
+    free_cached_symbol(xs_hash_put(nl->symbol_cache, cache_key, sym));
+    return sym;
+}
+
+void xs_netlister_init(xs_netlister *nl, xs_library_path *lp, int lvs_mode)
+{
+    nl->lvs_mode     = lvs_mode;
+    nl->library_path = lp;
+    nl->symbol_cache = xs_hash_new(64);
+}
+
+void xs_netlister_free(xs_netlister *nl)
+{
+    if (nl->symbol_cache) xs_hash_free(nl->symbol_cache, free_cached_symbol);
+    nl->symbol_cache = NULL;
 }
 
 int xs_netlister_resolve_symbols(xs_netlister *nl, xs_schematic *sch)
 {
-    /* Cached "missing" placeholder shared across all unresolved instances. */
-    xs_symbol *missing_proto = NULL;
-
-    for (int i = 0; i < sch->ninstances; i++) {
+    for (int i = 0; i < sch->instance_count; i++) {
         xs_instance *ins = &sch->instances[i];
-        xs_symbol *sym = (xs_symbol *)xs_hash_get((xs_hash *)nl->sym_cache,
-                                                  ins->symref);
-        if (!sym) {
-            char *path = xs_libpath_resolve(nl->lib, ins->symref);
-            if (!path) {
-                /* xschem in the same situation substitutes the symbol with
-                 * `systemlib/missing.sym`, whose format prints
-                 *   `*  @name -  @symname  IS MISSING !!!!`
-                 * Match that behavior so netgen LVS sees the same top-level
-                 * graph. */
-                if (!missing_proto) {
-                    missing_proto = xs_xmalloc(sizeof *missing_proto);
-                    memset(missing_proto, 0, sizeof *missing_proto);
-                    missing_proto->name = xs_strdup("missing");
-                    missing_proto->path = xs_strdup("(missing)");
-                    missing_proto->type = xs_strdup("missing");
-                    missing_proto->format =
-                        xs_strdup("*  @name -  @symname  IS MISSING !!!!");
-                    xs_hash_put((xs_hash *)nl->sym_cache,
-                                "__missing__", missing_proto);
-                }
-                ins->sym = missing_proto;
-                fprintf(stderr,
-                        "xschem2spice: warning: symbol '%s' not in libpath, treating as missing\n",
-                        ins->symref);
-                continue;
-            }
-            sym = xs_xmalloc(sizeof *sym);
-            if (xs_parse_symbol(path, sym) != 0) {
-                free(path);
-                free(sym);
-                return -1;
-            }
-            free(path);
-            xs_hash_put((xs_hash *)nl->sym_cache, ins->symref, sym);
+        xs_symbol *cached = xs_hash_get(nl->symbol_cache, ins->symref);
+        if (cached) { ins->resolved_symbol = cached; continue; }
+
+        char *path = xs_library_path_resolve(nl->library_path, ins->symref);
+        if (!path) {
+            fprintf(stderr,
+                    "xschem2spice: warning: symbol '%s' not in libpath, treating as missing\n",
+                    ins->symref);
+            ins->resolved_symbol = missing_symbol_placeholder(nl);
+            continue;
         }
-        ins->sym = sym;
+        xs_symbol *sym = xs_xmalloc(sizeof *sym);
+        if (xs_parse_symbol(path, sym) != 0) { free(path); free(sym); return -1; }
+        free(path);
+        xs_hash_put(nl->symbol_cache, ins->symref, sym);
+        ins->resolved_symbol = sym;
     }
     return 0;
 }
 
-/* ---------------- vertex / union-find ---------------- */
+/* ============================================================ *
+ * Connectivity graph (vertices + union-find)
+ *
+ * One vertex per wire endpoint and one per instance pin. Vertices at the
+ * same coordinate are unioned; type=short instances electrically merge their
+ * pins; wires with interior coincident points absorb them too.
+ * ============================================================ */
 
 typedef struct {
     double x, y;
-    int    inst;     /* -1 for wire endpoint */
-    int    pin;      /* index into instance's symbol pins; -1 for wire endpoint */
-} vertex_t;
+    int    instance_index;   /* -1 if vertex is a wire endpoint */
+    int    pin_index;        /* -1 if vertex is a wire endpoint */
+} graph_vertex;
 
 typedef struct {
     int *parent;
-    int  n;
-} ufd_t;
+    int  count;
+} disjoint_set;
 
-static int uf_find(ufd_t *u, int i)
+static int  disjoint_set_find_root(disjoint_set *set, int element_index);
+static void disjoint_set_union(disjoint_set *set, int first_element, int second_element);
+
+typedef struct {
+    graph_vertex *vertices;
+    int           vertex_count;
+
+    int          *instance_pin_offset;   /* [inst]  → first vertex index */
+    int          *wire_first_endpoint;   /* [wire]  → first endpoint vertex index */
+
+    disjoint_set  connected_vertex_sets;
+
+    int          *vertex_to_net;         /* [vertex] → 0..net_count-1 */
+    int           net_count;
+} connectivity_graph;
+
+static int disjoint_set_find_root(disjoint_set *set, int element_index)
 {
-    while (u->parent[i] != i) {
-        u->parent[i] = u->parent[u->parent[i]];
-        i = u->parent[i];
+    while (set->parent[element_index] != element_index) {
+        set->parent[element_index] = set->parent[set->parent[element_index]];
+        element_index = set->parent[element_index];
     }
-    return i;
+    return element_index;
 }
 
-static void uf_unite(ufd_t *u, int a, int b)
+static void disjoint_set_union(disjoint_set *set, int first_element, int second_element)
 {
-    int ra = uf_find(u, a);
-    int rb = uf_find(u, b);
-    if (ra != rb) u->parent[ra] = rb;
+    int first_root = disjoint_set_find_root(set, first_element);
+    int second_root = disjoint_set_find_root(set, second_element);
+    if (first_root != second_root) set->parent[first_root] = second_root;
 }
 
-static int dbleq(double a, double b)
-{
-    return fabs(a - b) < 1e-6;
-}
+static int coordinates_equal(double a, double b) { return fabs(a - b) < 1e-6; }
 
-/* Returns 1 if (px, py) lies on segment (ax,ay)–(bx,by) (incl. endpoints). */
-static int point_on_segment(double px, double py,
-                            double ax, double ay,
-                            double bx, double by)
+static int point_lies_on_segment(double px, double py,
+                                 double ax, double ay,
+                                 double bx, double by)
 {
     double cross = (px - ax) * (by - ay) - (py - ay) * (bx - ax);
     if (fabs(cross) > 1e-6) return 0;
-    /* dot of (P-A) with (B-A) gives projection */
-    double dot = (px - ax) * (bx - ax) + (py - ay) * (by - ay);
+    double dot   = (px - ax) * (bx - ax) + (py - ay) * (by - ay);
     if (dot < -1e-9) return 0;
-    double len2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
-    if (dot > len2 + 1e-9) return 0;
+    double len_sq = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
+    if (dot > len_sq + 1e-9) return 0;
     return 1;
 }
 
-/* ---------------- net naming ---------------- */
-
-typedef struct {
-    int   root;
-    char *label;       /* canonical label, NULL if auto-named */
-    char *auto_name;   /* malloc'd "netN" if used */
-} net_info_t;
-
-/* per-vertex; also a bag of labels collected during pass */
-typedef struct {
-    int   nvertices;
-    int  *root_to_idx;  /* root vertex id -> compact index into nets[] */
-    int   nnets;
-    net_info_t *nets;
-} netmap_t;
-
-static int is_label_type(const char *type)
+static void compute_pin_global_position(const xs_instance *ins, int pin_index,
+                                        double *x_out, double *y_out)
 {
-    if (!type) return 0;
-    return (strcmp(type, "ipin") == 0 ||
-            strcmp(type, "opin") == 0 ||
-            strcmp(type, "iopin") == 0 ||
-            strcmp(type, "label") == 0);
-}
-
-static int is_port_type(const char *type)
-{
-    if (!type) return 0;
-    return (strcmp(type, "ipin") == 0 ||
-            strcmp(type, "opin") == 0 ||
-            strcmp(type, "iopin") == 0);
-}
-
-/* ---------------- net name pretty-print ---------------- */
-
-/* In LVS mode, xschem strips a leading '#'. Also we always strip surrounding
- * whitespace and unify case-style. */
-static char *prettify_label(const char *raw, int lvs_mode)
-{
-    if (!raw) return NULL;
-    const char *p = raw;
-    while (*p == ' ' || *p == '\t') p++;
-    if (lvs_mode && *p == '#') p++;
-    char *r = xs_strdup(p);
-    /* trim trailing whitespace */
-    char *e = r + strlen(r);
-    while (e > r && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r')) e--;
-    *e = '\0';
-    return r;
-}
-
-/* ---------------- main netlist builder ---------------- */
-
-/* Get prop value from instance; if missing or empty, fall back to template default.
- * Returns malloc'd string (possibly empty). Never returns NULL. */
-static char *get_resolved_prop(const xs_instance *ins, const char *key)
-{
-    char *v = xs_prop_get(ins->prop, key);
-    if (v && *v) return v;
-    free(v);
-    if (ins->sym && ins->sym->template_) {
-        char *t = xs_prop_get(ins->sym->template_, key);
-        if (t) return t;
-    }
-    return xs_strdup("");
-}
-
-/* Strip `tcleval(<balanced>)` substrings from `s` and write the rest to `out`.
- * xschem evaluates these as Tcl; without an embedded interpreter the literal
- * text would otherwise leak through and confuse netgen LVS, which tries to
- * parse `if/elseif/return` inside the tcleval body as device names. */
-static void fputs_strip_tcleval(const char *s, FILE *out)
-{
-    if (!s) return;
-    while (*s) {
-        if (strncmp(s, "tcleval(", 8) == 0) {
-            s += 8;
-            int depth = 1;
-            while (*s && depth > 0) {
-                char c = *s++;
-                if (c == '\\' && *s) { s++; continue; }
-                if (c == '(') depth++;
-                else if (c == ')') { depth--; if (depth == 0) break; }
-            }
-            continue;
-        }
-        fputc(*s, out);
-        s++;
-    }
-}
-
-/* Substitute @<key> tokens in the format string.
- *
- * `name_override` (optional) replaces the value of @name; used for bus-name
- * instance expansion where each replica gets a per-bit name like `R5[3]`.
- */
-static void emit_subst_format_one(const char *fmt,
-                                  const xs_instance *ins,
-                                  char **pin_nets,
-                                  const char *symname,
-                                  const char *name_override,
-                                  FILE *out_real);
-
-static void emit_subst_format(const char *fmt,
-                              const xs_instance *ins,
-                              char **pin_nets,
-                              const char *symname,
-                              FILE *out_real)
-{
-    emit_subst_format_one(fmt, ins, pin_nets, symname, NULL, out_real);
-}
-
-static void emit_subst_format_one(const char *fmt,
-                                  const xs_instance *ins,
-                                  char **pin_nets,
-                                  const char *symname,
-                                  const char *name_override,
-                                  FILE *out_real)
-{
-    if (!fmt) return;
-    /* Substitute into an in-memory tmpfile() first, then post-process to strip
-     * unevaluable `tcleval(...)` blocks before writing to the real output. */
-    FILE *out = tmpfile();
-    if (!out) {
-        /* fall back to direct write if tmpfile fails */
-        out = out_real;
-    }
-    const char *p = fmt;
-    while (*p) {
-        if (*p == '\\' && p[1]) {
-            /* xschem template escape — \" → ", \\ → \ — but inside format
-             * string we usually only see \\ for backslashes. Pass through. */
-            fputc(p[1], out);
-            p += 2;
-            continue;
-        }
-        if (*p == '@') {
-            /* @@<pinname> — net connected to the symbol pin named <pinname>. */
-            if (p[1] == '@' && (isalpha((unsigned char)p[2]) || p[2] == '_')) {
-                const char *q = p + 2;
-                while (*q && (isalnum((unsigned char)*q) || *q == '_')) q++;
-                size_t kl = (size_t)(q - (p + 2));
-                char *name = xs_strndup(p + 2, kl);
-                int found = -1;
-                int npins = ins->sym ? ins->sym->npins : 0;
-                for (int j = 0; j < npins; j++) {
-                    if (ins->sym->pins[j].name &&
-                        strcmp(ins->sym->pins[j].name, name) == 0) {
-                        found = j; break;
-                    }
-                }
-                if (found >= 0 && pin_nets[found]) fputs(pin_nets[found], out);
-                else fputs("?", out);
-                free(name);
-                p = q;
-                continue;
-            }
-            /* Pin-net references: @#<N> or @#<N>:<attr> */
-            if (p[1] == '#' && isdigit((unsigned char)p[2])) {
-                const char *q = p + 2;
-                int idx = 0;
-                while (isdigit((unsigned char)*q)) { idx = idx * 10 + (*q - '0'); q++; }
-                /* optional :<attr> */
-                if (*q == ':') {
-                    const char *as = q + 1;
-                    const char *ae = as;
-                    while (*ae && (isalnum((unsigned char)*ae) || *ae == '_')) ae++;
-                    /* We only support :net_name (and treat :<anything> as net) */
-                    q = ae;
-                }
-                int npins = ins->sym ? ins->sym->npins : 0;
-                if (idx >= 0 && idx < npins && pin_nets[idx]) {
-                    fputs(pin_nets[idx], out);
-                } else {
-                    fputs("?", out);
-                }
-                p = q;
-                continue;
-            }
-            const char *q = p + 1;
-            /* alnum/underscore/dot? Just alnum/underscore. */
-            while (*q && (isalnum((unsigned char)*q) || *q == '_')) q++;
-            size_t kl = (size_t)(q - (p + 1));
-            if (kl == 0) { fputc('@', out); p++; continue; }
-            char *key = xs_strndup(p + 1, kl);
-            if (strcmp(key, "name") == 0) {
-                if (name_override) {
-                    fputs(name_override, out);
-                } else {
-                    char *v = xs_prop_get(ins->prop, "name");
-                    fputs(v ? v : "", out);
-                    free(v);
-                }
-            } else if (strcmp(key, "spiceprefix") == 0) {
-                char *v = xs_prop_get(ins->prop, "spiceprefix");
-                if (!v && ins->sym && ins->sym->template_) {
-                    v = xs_prop_get(ins->sym->template_, "spiceprefix");
-                }
-                fputs(v ? v : "", out);
-                free(v);
-            } else if (strcmp(key, "pinlist") == 0) {
-                int npins = ins->sym ? ins->sym->npins : 0;
-                for (int i = 0; i < npins; i++) {
-                    if (i) fputc(' ', out);
-                    fputs(pin_nets[i] ? pin_nets[i] : "?", out);
-                }
-            } else if (strcmp(key, "symname") == 0) {
-                fputs(symname ? symname : "", out);
-            } else if (strcmp(key, "path") == 0) {
-                /* hierarchical path — empty at top level */
-            } else if (strcmp(key, "savecurrent") == 0 ||
-                       strcmp(key, "spice_ignore") == 0) {
-                /* marker properties — xschem absorbs these and emits any
-                 * side effects (.save i(@name)) elsewhere. We just skip. */
-            } else {
-                /* lookup instance prop, then template default */
-                char *v = get_resolved_prop(ins, key);
-                fputs(v ? v : "", out);
-                free(v);
-            }
-            free(key);
-            p = q;
-            continue;
-        }
-        fputc(*p, out);
-        p++;
-    }
-    if (out != out_real) {
-        long n = ftell(out);
-        if (n < 0) n = 0;
-        char *contents = xs_xmalloc((size_t)n + 1);
-        rewind(out);
-        size_t got = fread(contents, 1, (size_t)n, out);
-        contents[got] = '\0';
-        fclose(out);
-        fputs_strip_tcleval(contents, out_real);
-        free(contents);
-    }
-}
-
-/* Determine pin0 (the connection pin) for a label-bearing symbol like
- * ipin/opin/lab_pin. We just take the first pin in the symbol. */
-static int label_pin_index(const xs_symbol *sym)
-{
-    return sym && sym->npins > 0 ? 0 : -1;
-}
-
-/* Compute global pin coordinate. */
-static void inst_pin_global(const xs_instance *ins, int pinix,
-                            double *gx, double *gy)
-{
-    const xs_pin *p = &ins->sym->pins[pinix];
+    const xs_symbol_pin *pin = &ins->resolved_symbol->pins[pin_index];
     double rx, ry;
-    xs_apply_xform(ins->rot, ins->flip, p->x, p->y, &rx, &ry);
-    *gx = ins->x + rx;
-    *gy = ins->y + ry;
+    xs_transform_pin_to_global(ins->rotation, ins->flip, pin->x, pin->y, &rx, &ry);
+    *x_out = ins->x + rx;
+    *y_out = ins->y + ry;
 }
 
-/* Bus-name syntax kinds, distinguishing xschem's two index forms:
- *   `:` (colon)  → scalar names use brackets, e.g. DATA[3]
- *   `..` (dotdot)→ scalar names omit brackets, e.g. DIN3
- * (See xschem/src/expandlabel.y: expandlabel_strbus vs strbus_nobracket.) */
-enum xs_bus_kind { XS_BUS_NONE = 0, XS_BUS_COLON = 1, XS_BUS_DOTDOT = 2 };
-
-/* Parse "<base>[<hi>:<lo>]" or "<base>[<hi>..<lo>]". Returns the multiplicity
- * (|hi-lo|+1) on match, or 0. Out params: *base_len = strlen(base); hi/lo
- * indices; kind = which syntax. */
-static int parse_bus_name(const char *s, size_t *base_len,
-                          int *hi, int *lo, int *kind)
+/* Phase 1: lay out one vertex per wire endpoint (first), then one per
+ * instance pin. The contiguous-block layout lets us index into the vertex
+ * array via cheap offsets later. */
+static void allocate_and_populate_vertices(connectivity_graph *g,
+                                           const xs_schematic *sch)
 {
-    if (kind) *kind = XS_BUS_NONE;
-    if (!s) return 0;
-    const char *lb = strchr(s, '[');
-    if (!lb) return 0;
-    int h, l;
-    if (sscanf(lb, "[%d..%d]", &h, &l) == 2) {
-        if (kind) *kind = XS_BUS_DOTDOT;
-    } else if (sscanf(lb, "[%d:%d]", &h, &l) == 2) {
-        if (kind) *kind = XS_BUS_COLON;
-    } else {
-        return 0;
+    int upper_bound = sch->wire_count * 2;
+    for (int i = 0; i < sch->instance_count; i++)
+        upper_bound += sch->instances[i].resolved_symbol->pin_count;
+
+    g->vertices            = xs_xmalloc(sizeof(graph_vertex) * (size_t)(upper_bound + 1));
+    g->instance_pin_offset = xs_xmalloc(sizeof(int) * (size_t)(sch->instance_count + 1));
+    g->wire_first_endpoint = xs_xmalloc(sizeof(int) * (size_t)(sch->wire_count + 1));
+    g->vertex_count        = 0;
+
+    for (int w_idx = 0; w_idx < sch->wire_count; w_idx++) {
+        const xs_wire *w = &sch->wires[w_idx];
+        g->wire_first_endpoint[w_idx]  = g->vertex_count;
+        g->vertices[g->vertex_count++] = (graph_vertex){ w->x1, w->y1, -1, -1 };
+        g->vertices[g->vertex_count++] = (graph_vertex){ w->x2, w->y2, -1, -1 };
     }
-    *base_len = (size_t)(lb - s);
-    *hi = h;
-    *lo = l;
-    return (h >= l) ? (h - l + 1) : (l - h + 1);
-}
-
-/* Render the i-th scalar of a bus, given the kind and base. */
-static void render_bus_scalar(char *buf, size_t bufsz,
-                              const char *base, size_t base_len,
-                              int idx, int kind)
-{
-    if (kind == XS_BUS_DOTDOT) {
-        snprintf(buf, bufsz, "%.*s%d", (int)base_len, base, idx);
-    } else {
-        snprintf(buf, bufsz, "%.*s[%d]", (int)base_len, base, idx);
+    for (int i = 0; i < sch->instance_count; i++) {
+        g->instance_pin_offset[i] = g->vertex_count;
+        const xs_instance *ins = &sch->instances[i];
+        for (int j = 0; j < ins->resolved_symbol->pin_count; j++) {
+            double gx, gy;
+            compute_pin_global_position(ins, j, &gx, &gy);
+            g->vertices[g->vertex_count++] = (graph_vertex){ gx, gy, i, j };
+        }
     }
 }
 
-/* Symbol shortname: drop any directory and .sym/.sch suffix. */
-static char *symbol_short_name(const char *symref)
+/* Phase 2a: vertices that share coordinates are the same physical point. */
+static void union_coincident_vertices(connectivity_graph *g)
 {
-    const char *slash = strrchr(symref, '/');
-    const char *base = slash ? slash + 1 : symref;
-    size_t bl = strlen(base);
-    if (bl >= 4 && (strcmp(base + bl - 4, ".sym") == 0 ||
-                    strcmp(base + bl - 4, ".sch") == 0))
-        bl -= 4;
-    return xs_strndup(base, bl);
+    for (int i = 0; i < g->vertex_count; i++)
+        for (int j = i + 1; j < g->vertex_count; j++)
+            if (coordinates_equal(g->vertices[i].x, g->vertices[j].x) &&
+                coordinates_equal(g->vertices[i].y, g->vertices[j].y))
+                disjoint_set_union(&g->connected_vertex_sets, i, j);
 }
+
+/* Phase 2b: type=short instances electrically tie all their pins together. */
+static void union_short_instance_pins(connectivity_graph *g, const xs_schematic *sch)
+{
+    for (int i = 0; i < sch->instance_count; i++) {
+        const xs_instance *ins = &sch->instances[i];
+        if (!symbol_type_equals(ins->resolved_symbol->type, "short")) continue;
+        if (ins->resolved_symbol->pin_count < 2) continue;
+        int first_pin_vertex = g->instance_pin_offset[i];
+        for (int j = 1; j < ins->resolved_symbol->pin_count; j++)
+            disjoint_set_union(&g->connected_vertex_sets,
+                               first_pin_vertex,
+                               g->instance_pin_offset[i] + j);
+    }
+}
+
+/* Phase 2c: each wire's two endpoints are connected; any vertex that lies on
+ * the wire segment's interior is also absorbed into that net. */
+static void union_wire_segments_with_interior_points(connectivity_graph *g,
+                                                     const xs_schematic *sch)
+{
+    for (int w_idx = 0; w_idx < sch->wire_count; w_idx++) {
+        const xs_wire *w = &sch->wires[w_idx];
+        int endpoint_a = g->wire_first_endpoint[w_idx];
+        int endpoint_b = endpoint_a + 1;
+        disjoint_set_union(&g->connected_vertex_sets, endpoint_a, endpoint_b);
+        for (int v = 0; v < g->vertex_count; v++) {
+            if (v == endpoint_a || v == endpoint_b) continue;
+            if (point_lies_on_segment(g->vertices[v].x, g->vertices[v].y,
+                                      w->x1, w->y1, w->x2, w->y2))
+                disjoint_set_union(&g->connected_vertex_sets, v, endpoint_a);
+        }
+    }
+}
+
+/* Phase 3: compact disjoint-set roots into dense net ids 0..net_count-1. */
+static void assign_dense_net_ids(connectivity_graph *g)
+{
+    g->vertex_to_net = xs_xmalloc(sizeof(int) * (size_t)g->vertex_count);
+    for (int i = 0; i < g->vertex_count; i++) g->vertex_to_net[i] = -1;
+    g->net_count = 0;
+    for (int i = 0; i < g->vertex_count; i++) {
+        int root = disjoint_set_find_root(&g->connected_vertex_sets, i);
+        if (g->vertex_to_net[root] == -1) g->vertex_to_net[root] = g->net_count++;
+    }
+}
+
+static void build_connectivity_graph(connectivity_graph *g, const xs_schematic *sch)
+{
+    allocate_and_populate_vertices(g, sch);
+
+    g->connected_vertex_sets.parent = xs_xmalloc(sizeof(int) * (size_t)g->vertex_count);
+    g->connected_vertex_sets.count  = g->vertex_count;
+    for (int i = 0; i < g->vertex_count; i++) g->connected_vertex_sets.parent[i] = i;
+
+    union_coincident_vertices                  (g);
+    union_short_instance_pins                  (g, sch);
+    union_wire_segments_with_interior_points   (g, sch);
+    assign_dense_net_ids                       (g);
+}
+
+static void free_connectivity_graph(connectivity_graph *g)
+{
+    free(g->vertices);
+    free(g->instance_pin_offset);
+    free(g->wire_first_endpoint);
+    free(g->connected_vertex_sets.parent);
+    free(g->vertex_to_net);
+}
+
+static int net_id_for_pin(const connectivity_graph *g_const, int instance_index, int pin_index)
+{
+    /* disjoint_set_find_root mutates parent[] for path compression — that's a
+     * read-only operation semantically, so cast the const away locally. */
+    disjoint_set *connected_vertex_sets = (disjoint_set *)&g_const->connected_vertex_sets;
+    int v = g_const->instance_pin_offset[instance_index] + pin_index;
+    return g_const->vertex_to_net[disjoint_set_find_root(connected_vertex_sets, v)];
+}
+
+/* ============================================================ *
+ * Net-label table  —  priority-based net naming
+ * ============================================================ */
+
+typedef struct {
+    char **labels;
+    int   *priorities;
+    int    net_count;
+} net_label_table;
+
+static void net_label_table_init(net_label_table *t, int net_count)
+{
+    t->labels     = xs_xmalloc(sizeof(char *) * (size_t)(net_count + 1));
+    t->priorities = xs_xmalloc(sizeof(int)    * (size_t)(net_count + 1));
+    for (int i = 0; i < net_count; i++) {
+        t->labels[i]     = NULL;
+        t->priorities[i] = NET_LABEL_PRIO_NONE;
+    }
+    t->net_count = net_count;
+}
+
+static void net_label_table_free(net_label_table *t)
+{
+    for (int i = 0; i < t->net_count; i++) free(t->labels[i]);
+    free(t->labels);
+    free(t->priorities);
+}
+
+/* Compare-and-assign with priority. Higher priority wins; on tie, the
+ * alphabetically-earlier name wins (deterministic). Takes ownership of
+ * `name`. */
+static void net_label_table_propose(net_label_table *t, int net,
+                                    char *name, int priority)
+{
+    int existing_prio = t->priorities[net];
+    int wins = 0;
+    if (priority > existing_prio) wins = 1;
+    else if (priority == existing_prio && t->labels[net] &&
+             strcmp(t->labels[net], name) > 0) wins = 1;
+    if (wins) {
+        free(t->labels[net]);
+        t->labels[net]     = name;
+        t->priorities[net] = priority;
+    } else {
+        free(name);
+    }
+}
+
+/* For each ipin/opin/iopin/lab_pin/lab_wire instance, the net at its first pin
+ * inherits its `lab=` value. Mirrors XSCHEM's
+ *   name_nodes_of_pins_labels_and_propagate():
+ *     https://github.com/StefanSchippers/xschem/blob/3.4.7/src/netlist.c#L1255-L1380
+ * (we don't run XSCHEM's recursive `wirecheck` because our union-find has
+ * already merged everything connected at the same coordinate). */
+static void apply_instance_label_pins(net_label_table *t,
+                                      const connectivity_graph *g,
+                                      const xs_schematic *sch, int lvs_mode)
+{
+    for (int i = 0; i < sch->instance_count; i++) {
+        const xs_instance *ins = &sch->instances[i];
+        if (!symbol_type_is_label_or_pin(ins->resolved_symbol->type)) continue;
+        if (ins->resolved_symbol->pin_count < 1) continue;
+        char *raw = xs_prop_get(ins->prop_block, "lab");
+        if (!raw) continue;
+        char *pretty = normalize_net_label(raw, lvs_mode);
+        free(raw);
+        int net      = net_id_for_pin(g, i, 0);
+        int priority = symbol_type_is_port(ins->resolved_symbol->type)
+                       ? NET_LABEL_PRIO_PORT
+                       : NET_LABEL_PRIO_LAB_PIN;
+        net_label_table_propose(t, net, pretty, priority);
+    }
+}
+
+/* xschem's bus_tap basename extraction from a comma-list bus name like
+ *   "CK , S1, ADD[3:0], ENAB"
+ * walks back from the first `[` until a `,` (skip spaces) and returns the
+ * preceding identifier (`ADD`). Mirrors instcheck() at
+ *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/netlist.c#L1187-L1196 */
+static void copy_bus_basename_around_first_bracket(const char *bus_name,
+                                                   const char **base_start_out,
+                                                   size_t *base_length_out)
+{
+    const char *first_bracket = strchr(bus_name, '[');
+    if (!first_bracket) {
+        *base_start_out  = bus_name;
+        *base_length_out = strlen(bus_name);
+        return;
+    }
+    const char *p = first_bracket;
+    while (p > bus_name) {
+        p--;
+        if (*p == ',') { do { p++; } while (*p == ' '); break; }
+    }
+    if (*p == ',' || p < bus_name) p = bus_name;
+    *base_start_out  = p;
+    *base_length_out = (size_t)(first_bracket - p);
+}
+
+/* For each `type=bus_tap` instance, derive the tap pin's net name from the
+ * bus pin's resolved net name plus the instance's `lab=` value. Mirrors
+ * instcheck() bus-tap branch at
+ *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/netlist.c#L1173-L1216 */
+/* Locate the "tap" and "bus" pin indices on a bus_tap symbol; xschem's
+ * convention is tap=0, bus=1 (used as default if pin names are absent). */
+static void find_bus_tap_pins(const xs_symbol *sym, int *tap_pin, int *bus_pin)
+{
+    *tap_pin = 0; *bus_pin = 1;
+    for (int j = 0; j < sym->pin_count; j++) {
+        const char *name = sym->pins[j].name;
+        if (!name) continue;
+        if (!strcmp(name, "tap")) *tap_pin = j;
+        else if (!strcmp(name, "bus")) *bus_pin = j;
+    }
+}
+
+static int string_is_only_digits(const char *s)
+{
+    if (!s || !*s) return 0;
+    for (; *s; s++) if (!isdigit((unsigned char)*s)) return 0;
+    return 1;
+}
+
+/* Combine the bus's basename (e.g. "ADD" extracted from "CK , S1, ADD[3:0]")
+ * with the slice token (e.g. "[3:0]") to produce the tap pin's net name. */
+static char *splice_basename_with_slice(const char *bus_name, const char *slice)
+{
+    const char *base_start;
+    size_t      base_length;
+    copy_bus_basename_around_first_bracket(bus_name, &base_start, &base_length);
+
+    size_t total = base_length + strlen(slice);
+    char  *out   = xs_xmalloc(total + 1);
+    memcpy(out, base_start, base_length);
+    memcpy(out + base_length, slice, strlen(slice));
+    out[total] = '\0';
+    return out;
+}
+
+static void apply_bus_taps(net_label_table *t, const connectivity_graph *g,
+                           const xs_schematic *sch)
+{
+    for (int i = 0; i < sch->instance_count; i++) {
+        const xs_instance *ins = &sch->instances[i];
+        if (!symbol_type_equals(ins->resolved_symbol->type, "bus_tap")) continue;
+        if (ins->resolved_symbol->pin_count < 2) continue;
+
+        int tap_pin, bus_pin;
+        find_bus_tap_pins(ins->resolved_symbol, &tap_pin, &bus_pin);
+
+        int         tap_net  = net_id_for_pin(g, i, tap_pin);
+        const char *bus_name = t->labels[net_id_for_pin(g, i, bus_pin)];
+        if (!bus_name) continue;
+
+        char *tap_lab = xs_prop_get(ins->prop_block, "lab");
+        if (!tap_lab && ins->resolved_symbol->template_)
+            tap_lab = xs_prop_get(ins->resolved_symbol->template_, "lab");
+        if (!tap_lab || !*tap_lab) { free(tap_lab); continue; }
+
+        /* xschem's rule: a tap label that starts with `[` or is purely digits
+         * is a bus slice; otherwise it's the literal scalar net name. */
+        int   is_bus_slice = (tap_lab[0] == '[') || string_is_only_digits(tap_lab);
+        char *scalar       = is_bus_slice
+                           ? splice_basename_with_slice(bus_name, tap_lab)
+                           : xs_strdup(tap_lab);
+        free(tap_lab);
+
+        net_label_table_propose(t, tap_net, scalar, NET_LABEL_PRIO_LAB_PIN);
+    }
+}
+
+/* Mark "used" any net that some non-label instance pin connects to; used
+ * unlabeled nets get a deterministic auto-name like `net1`, `net2`. */
+static void apply_auto_names_to_used_unlabeled_nets(net_label_table *t,
+                                                    const connectivity_graph *g,
+                                                    const xs_schematic *sch)
+{
+    int *net_is_used = xs_xmalloc(sizeof(int) * (size_t)t->net_count);
+    for (int i = 0; i < t->net_count; i++) net_is_used[i] = 0;
+
+    for (int i = 0; i < sch->instance_count; i++) {
+        const xs_instance *ins = &sch->instances[i];
+        if (symbol_type_is_label_or_pin(ins->resolved_symbol->type)) continue;
+        for (int j = 0; j < ins->resolved_symbol->pin_count; j++) {
+            int net = net_id_for_pin(g, i, j);
+            net_is_used[net] = 1;
+        }
+    }
+
+    int next_auto_index = 0;
+    for (int i = 0; i < t->net_count; i++) {
+        if (t->labels[i] || !net_is_used[i]) continue;
+        char buf[32];
+        snprintf(buf, sizeof buf, "net%d", ++next_auto_index);
+        t->labels[i] = xs_strdup(buf);
+    }
+    free(net_is_used);
+}
+
+/* ============================================================ *
+ * Subckt port list
+ *
+ * Preferred source: companion `<cell>.sym`'s B-record pin order (with bus
+ * expansion). Fallback when no .sym is available: ipin/opin/iopin instances
+ * in source order, by direction.
+ * ============================================================ */
+
+typedef struct {
+    char **names;
+    char  *kinds;     /* 'I' | 'O' | 'B' | 0 (unknown) */
+    int    count;
+    int    capacity;
+} port_list;
+
+static void port_list_init(port_list *p)
+{
+    p->names    = NULL;
+    p->kinds    = NULL;
+    p->count    = 0;
+    p->capacity = 0;
+}
+
+static void port_list_free(port_list *p)
+{
+    for (int i = 0; i < p->count; i++) free(p->names[i]);
+    free(p->names);
+    free(p->kinds);
+}
+
+static int port_list_contains(const port_list *p, const char *name)
+{
+    for (int i = 0; i < p->count; i++)
+        if (strcmp(p->names[i], name) == 0) return 1;
+    return 0;
+}
+
+static void port_list_grow(port_list *p)
+{
+    if (p->count < p->capacity) return;
+    int new_cap = p->capacity ? p->capacity * 2 : 16;
+    p->names = xs_xrealloc(p->names, sizeof(char *) * (size_t)new_cap);
+    p->kinds = xs_xrealloc(p->kinds, sizeof(char)   * (size_t)new_cap);
+    p->capacity = new_cap;
+}
+
+/* Adds the port if its name is not already present. Takes ownership of
+ * `name` (frees it if it would be a duplicate). */
+static void port_list_add_unique_taking_ownership(port_list *p, char *name, char kind)
+{
+    if (port_list_contains(p, name)) { free(name); return; }
+    port_list_grow(p);
+    p->names[p->count] = name;
+    p->kinds[p->count] = kind;
+    p->count++;
+}
+
+/* Look up the port direction kind ('I'|'O'|'B') from the schematic's own
+ * ipin/opin/iopin instances by matching their lab against `name`. */
+static char find_port_kind_from_schematic(const xs_schematic *sch,
+                                          const char *name, int lvs_mode)
+{
+    for (int i = 0; i < sch->instance_count; i++) {
+        const xs_instance *ins = &sch->instances[i];
+        if (!symbol_type_is_port(ins->resolved_symbol->type)) continue;
+        char *raw = xs_prop_get(ins->prop_block, "lab");
+        if (!raw || !*raw) { free(raw); continue; }
+        char *pretty = normalize_net_label(raw, lvs_mode);
+        free(raw);
+        int matches = strcmp(pretty, name) == 0;
+        free(pretty);
+        if (matches) {
+            const char *t = ins->resolved_symbol->type;
+            return !strcmp(t, "ipin") ? 'I' : !strcmp(t, "opin") ? 'O' : 'B';
+        }
+    }
+    return 0;
+}
+
+/* Add a single self-symbol pin (or its bus-expansion) to the port list. */
+static void add_self_sym_pin_to_ports(port_list *ports, const xs_symbol_pin *pin,
+                                      const xs_schematic *sch, int lvs_mode)
+{
+    bus_designator bus;
+    if (parse_bus_designator(pin->name, &bus) > 0) {
+        int step = (bus.hi >= bus.lo) ? -1 : 1;
+        for (int k = 0; k < bus.multiplicity; k++) {
+            char buf[256];
+            format_bus_scalar(buf, sizeof buf, pin->name, &bus, bus.hi + step * k);
+            char *name = xs_strdup(buf);
+            port_list_add_unique_taking_ownership(ports, name,
+                find_port_kind_from_schematic(sch, name, lvs_mode));
+        }
+    } else {
+        char *name = xs_strdup(pin->name);
+        port_list_add_unique_taking_ownership(ports, name,
+            find_port_kind_from_schematic(sch, name, lvs_mode));
+    }
+}
+
+static void build_subckt_port_list_from_self_sym(port_list *ports,
+                                                 const xs_symbol *self_sym,
+                                                 const xs_schematic *sch,
+                                                 int lvs_mode)
+{
+    for (int i = 0; i < self_sym->pin_count; i++) {
+        if (!self_sym->pins[i].name) continue;
+        add_self_sym_pin_to_ports(ports, &self_sym->pins[i], sch, lvs_mode);
+    }
+}
+
+static void build_subckt_port_list_from_schematic_ports(port_list *ports,
+                                                        const xs_schematic *sch,
+                                                        int lvs_mode)
+{
+    /* ipins, then opins, then iopins, in source order. */
+    static const char *type_pass_order[] = { "ipin", "opin", "iopin" };
+    static const char  kind_per_pass[]   = { 'I',     'O',    'B'   };
+
+    for (int pass = 0; pass < 3; pass++) {
+        for (int i = 0; i < sch->instance_count; i++) {
+            const xs_instance *ins = &sch->instances[i];
+            if (!symbol_type_equals(ins->resolved_symbol->type, type_pass_order[pass]))
+                continue;
+            char *raw = xs_prop_get(ins->prop_block, "lab");
+            if (!raw || !*raw) { free(raw); continue; }
+            char *pretty = normalize_net_label(raw, lvs_mode);
+            free(raw);
+            port_list_add_unique_taking_ownership(ports, pretty, kind_per_pass[pass]);
+        }
+    }
+}
+
+static void build_subckt_port_list(port_list *ports, xs_netlister *nl,
+                                   const xs_schematic *sch)
+{
+    xs_symbol *self_sym = load_companion_sym_for_schematic(nl, sch);
+    if (self_sym && self_sym->pin_count > 0)
+        build_subckt_port_list_from_self_sym(ports, self_sym, sch, nl->lvs_mode);
+    else
+        build_subckt_port_list_from_schematic_ports(ports, sch, nl->lvs_mode);
+}
+
+/* ============================================================ *
+ * Format substitution and emission
+ *
+ * Mirrors XSCHEM's print_spice_element() at
+ *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/token.c#L2150-L2535
+ * ============================================================ */
+
+/* Discard `tcleval(<balanced>)` substrings; without an embedded interpreter
+ * the literal text would otherwise leak through and confuse netgen LVS. */
+static void write_stripping_unevaluated_tcleval(FILE *out, const char *src)
+{
+    if (!src) return;
+    for (const char *p = src; *p; ) {
+        if (strncmp(p, "tcleval(", 8) == 0) {
+            p += 8;
+            int depth = 1;
+            while (*p && depth > 0) {
+                char c = *p++;
+                if (c == '\\' && *p) { p++; continue; }
+                if (c == '(') depth++;
+                else if (c == ')' && --depth == 0) break;
+            }
+            continue;
+        }
+        fputc(*p++, out);
+    }
+}
+
+static int find_pin_index_by_name(const xs_symbol *sym, const char *name)
+{
+    if (!sym) return -1;
+    for (int j = 0; j < sym->pin_count; j++)
+        if (sym->pins[j].name && strcmp(sym->pins[j].name, name) == 0) return j;
+    return -1;
+}
+
+static const char *advance_past_identifier(const char *p)
+{
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
+    return p;
+}
+
+static void append_net_or_qmark(xs_string_buffer *out, const char *net_or_null)
+{
+    xs_string_buffer_append(out, net_or_null ? net_or_null : "?");
+}
+
+/* Substitution shape: bundles every input the @-token expansion needs. */
+typedef struct {
+    const xs_instance  *instance;
+    char  *const       *pin_nets;
+    const char         *symbol_short_name;
+    const char         *instance_name_override;  /* non-NULL for bus replicas */
+} substitution_context;
+
+/* Look up `key` from the instance, then the symbol's template default; for
+ * `spiceprefix` xschem additionally falls through to the template. */
+static char *fetch_keyed_value(const substitution_context *ctx, const char *key)
+{
+    if (!strcmp(key, "spiceprefix")) {
+        char *v = xs_prop_get(ctx->instance->prop_block, "spiceprefix");
+        if (v) return v;
+        if (ctx->instance->resolved_symbol &&
+            ctx->instance->resolved_symbol->template_)
+            return xs_prop_get(ctx->instance->resolved_symbol->template_, "spiceprefix");
+        return NULL;
+    }
+    return lookup_property_with_template_fallback(ctx->instance, key);
+}
+
+/* Append the substitution for `@@<pinname>`. Returns the cursor past the
+ * consumed token. */
+static const char *append_pin_by_name(xs_string_buffer *out,
+                                      const char *cursor,
+                                      const substitution_context *ctx)
+{
+    const char *name_start = cursor + 2;
+    const char *name_end   = advance_past_identifier(name_start);
+    char       *pin_name   = xs_strndup(name_start, (size_t)(name_end - name_start));
+    int         pin_index  = find_pin_index_by_name(ctx->instance->resolved_symbol,
+                                                    pin_name);
+    free(pin_name);
+    append_net_or_qmark(out, pin_index >= 0 ? ctx->pin_nets[pin_index] : NULL);
+    return name_end;
+}
+
+/* Append the substitution for `@#<idx>` (alias `@#<idx>:<attr>`). */
+static const char *append_pin_by_index(xs_string_buffer *out,
+                                       const char *cursor,
+                                       const substitution_context *ctx)
+{
+    const char *p   = cursor + 2;
+    int         idx = 0;
+    while (isdigit((unsigned char)*p)) { idx = idx * 10 + (*p - '0'); p++; }
+    if (*p == ':') p = advance_past_identifier(p + 1);
+
+    int pin_count = ctx->instance->resolved_symbol
+                  ? ctx->instance->resolved_symbol->pin_count : 0;
+    append_net_or_qmark(out,
+        idx >= 0 && idx < pin_count ? ctx->pin_nets[idx] : NULL);
+    return p;
+}
+
+/* Append the substitution for a generic `@<key>` token. */
+static const char *append_at_key(xs_string_buffer *out,
+                                 const char *cursor,
+                                 const substitution_context *ctx)
+{
+    const char *key_start = cursor + 1;
+    const char *key_end   = advance_past_identifier(key_start);
+    if (key_start == key_end) {
+        xs_string_buffer_append_char(out, '@');
+        return cursor + 1;
+    }
+    char *key = xs_strndup(key_start, (size_t)(key_end - key_start));
+
+    if (!strcmp(key, "name") && ctx->instance_name_override) {
+        xs_string_buffer_append(out, ctx->instance_name_override);
+    } else if (!strcmp(key, "name")) {
+        char *v = xs_prop_get(ctx->instance->prop_block, "name");
+        if (v) xs_string_buffer_append(out, v);
+        free(v);
+    } else if (!strcmp(key, "symname")) {
+        if (ctx->symbol_short_name) xs_string_buffer_append(out, ctx->symbol_short_name);
+    } else if (!strcmp(key, "pinlist")) {
+        int pin_count = ctx->instance->resolved_symbol
+                      ? ctx->instance->resolved_symbol->pin_count : 0;
+        for (int i = 0; i < pin_count; i++) {
+            if (i) xs_string_buffer_append_char(out, ' ');
+            append_net_or_qmark(out, ctx->pin_nets[i]);
+        }
+    } else if (!strcmp(key, "path") || !strcmp(key, "savecurrent") ||
+               !strcmp(key, "spice_ignore")) {
+        /* `path` is the hierarchical prefix (empty at top level). The other
+         * two are marker properties that xschem absorbs and emits as side
+         * effects (e.g. `.save i(@name)` for savecurrent). */
+    } else {
+        char *v = fetch_keyed_value(ctx, key);
+        if (v) xs_string_buffer_append(out, v);
+        free(v);
+    }
+    free(key);
+    return key_end;
+}
+
+/*
+ * Walk `format`, expanding @-tokens into `out`:
+ *   @@<pin>             net at the symbol pin named <pin>
+ *   @#<idx>             net at pin index <idx> (alias @#<idx>:net_name)
+ *   @name               instance's name (or override, used for bus replicas)
+ *   @symname            symbol short name (no directory, no extension)
+ *   @pinlist            space-separated nets, in symbol-pin order
+ *   @<key>              instance property (falls through to symbol template)
+ *   @path/@savecurrent/@spice_ignore are absorbed.
+ */
+static void substitute_format_into_buffer(xs_string_buffer *out,
+                                          const char *format,
+                                          const substitution_context *ctx)
+{
+    for (const char *p = format; *p; ) {
+        if (*p == '\\' && p[1]) {                       /* template escape */
+            xs_string_buffer_append_char(out, p[1]);
+            p += 2;
+        } else if (*p != '@') {
+            xs_string_buffer_append_char(out, *p++);
+        } else if (p[1] == '@' && (isalpha((unsigned char)p[2]) || p[2] == '_')) {
+            p = append_pin_by_name (out, p, ctx);
+        } else if (p[1] == '#' && isdigit((unsigned char)p[2])) {
+            p = append_pin_by_index(out, p, ctx);
+        } else {
+            p = append_at_key      (out, p, ctx);
+        }
+    }
+}
+
+/* Substitute @-tokens in `format` and write the result to `out`, with
+ * unevaluable tcleval(...) blocks elided. */
+static void emit_substituted_format(FILE *out, const char *format,
+                                    const xs_instance *ins,
+                                    char *const *pin_nets,
+                                    const char *symname,
+                                    const char *name_override)
+{
+    if (!format) return;
+    substitution_context ctx = {
+        .instance               = ins,
+        .pin_nets               = pin_nets,
+        .symbol_short_name      = symname,
+        .instance_name_override = name_override,
+    };
+    xs_string_buffer raw;
+    xs_string_buffer_init(&raw);
+    substitute_format_into_buffer(&raw, format, &ctx);
+    if (raw.buffer) write_stripping_unevaluated_tcleval(out, raw.buffer);
+    xs_string_buffer_free(&raw);
+}
+
+static void emit_save_current_line_if_requested(FILE *out, const xs_instance *ins)
+{
+    char *sc = lookup_property_with_template_fallback(ins, "savecurrent");
+    if (!sc || strcmp(sc, "true") != 0) { free(sc); return; }
+    free(sc);
+    char *iname = xs_prop_get(ins->prop_block, "name");
+    if (iname && *iname) {
+        fputs(".save i(", out);
+        for (char *q = iname; *q; q++) fputc(tolower((unsigned char)*q), out);
+        fputs(")\n", out);
+    }
+    free(iname);
+}
+
+/* Pick the format string we'll substitute against. lvs_format wins in lvs_mode;
+ * otherwise fall back to the regular `format`. */
+static const char *select_emission_format(const xs_instance *ins, int lvs_mode)
+{
+    const xs_symbol *s = ins->resolved_symbol;
+    if (lvs_mode && s->lvs_format && *s->lvs_format) return s->lvs_format;
+    if (s->format && *s->format)                     return s->format;
+    return NULL;
+}
+
+/* xschem's bit-iteration convention: replica k corresponds to the bus-bit at
+ * (hi + step*k), i.e. msb-first when hi >= lo and lsb-first when hi < lo. */
+static int bus_bit_for_replica(const bus_designator *bus, int replica_index)
+{
+    int step = (bus->hi >= bus->lo) ? -1 : 1;
+    return bus->hi + step * replica_index;
+}
+
+/* For a bus-named instance like `R5[3:0]`, emit one device line per bit. Pins
+ * whose net is a same-multiplicity bus get mapped to the corresponding scalar
+ * (e.g. `DATA[15:12]` becomes `DATA[15]`, …, `DATA[12]`); other pins keep
+ * their net name across replicas. */
+static void emit_bus_expanded_instance(FILE *out, const xs_instance *ins,
+                                       const char *format, char **pin_nets,
+                                       const char *symbol_short,
+                                       const char *instance_name,
+                                       const bus_designator *instance_bus)
+{
+    int pin_count = ins->resolved_symbol->pin_count;
+
+    bus_designator *pin_bus = xs_xmalloc(sizeof(bus_designator) * (size_t)pin_count);
+    for (int j = 0; j < pin_count; j++)
+        parse_bus_designator(pin_nets[j], &pin_bus[j]);
+
+    char **resolved_pin_nets = xs_xmalloc(sizeof(char *) * (size_t)pin_count);
+
+    for (int replica = 0; replica < instance_bus->multiplicity; replica++) {
+        char replica_name[256];
+        format_bus_scalar(replica_name, sizeof replica_name,
+                          instance_name, instance_bus,
+                          bus_bit_for_replica(instance_bus, replica));
+
+        for (int j = 0; j < pin_count; j++) {
+            if (pin_bus[j].multiplicity != instance_bus->multiplicity) {
+                resolved_pin_nets[j] = pin_nets[j];
+                continue;
+            }
+            char scalar[256];
+            format_bus_scalar(scalar, sizeof scalar, pin_nets[j], &pin_bus[j],
+                              bus_bit_for_replica(&pin_bus[j], replica));
+            resolved_pin_nets[j] = xs_strdup(scalar);
+        }
+
+        emit_substituted_format(out, format, ins, resolved_pin_nets,
+                                symbol_short, replica_name);
+        fputc('\n', out);
+
+        for (int j = 0; j < pin_count; j++) {
+            if (resolved_pin_nets[j] != pin_nets[j]) free(resolved_pin_nets[j]);
+        }
+    }
+
+    free(pin_bus);
+    free(resolved_pin_nets);
+}
+
+static void emit_one_device(FILE *out, const xs_instance *ins,
+                            const connectivity_graph *g,
+                            const net_label_table *labels,
+                            int instance_index, int lvs_mode)
+{
+    const xs_symbol *sym = ins->resolved_symbol;
+
+    /* spice_ignore on the instance OR (inherited) on the symbol skips it. */
+    char *si = xs_prop_get(ins->prop_block, "spice_ignore");
+    if (!si && sym->spice_ignore) si = xs_strdup(sym->spice_ignore);
+    int ignore = spice_ignore_value_is_truthy(si);
+    free(si);
+    if (ignore) return;
+
+    /* type=subcircuit is replaced by `* IS MISSING !!!!` (we never recurse). */
+    if (symbol_type_equals(sym->type, "subcircuit")) {
+        char *iname = xs_prop_get(ins->prop_block, "name");
+        char *sname = symref_basename_without_extension(ins->symref);
+        fprintf(out, "*  %s -  %s  IS MISSING !!!!\n",
+                iname ? iname : "?", sname ? sname : "?");
+        free(iname);
+        free(sname);
+        return;
+    }
+
+    const char *format = select_emission_format(ins, lvs_mode);
+    if (!format) return;
+
+    /* Gather pin nets. */
+    int npins = sym->pin_count;
+    char **pin_nets = xs_xmalloc(sizeof(char *) * (size_t)(npins + 1));
+    for (int j = 0; j < npins; j++)
+        pin_nets[j] = labels->labels[net_id_for_pin(g, instance_index, j)];
+
+    char *symname = symref_basename_without_extension(ins->symref);
+    char *iname   = xs_prop_get(ins->prop_block, "name");
+    bus_designator inst_bus;
+    int multiplicity = iname ? parse_bus_designator(iname, &inst_bus) : 0;
+
+    if (multiplicity > 1)
+        emit_bus_expanded_instance(out, ins, format, pin_nets, symname,
+                                   iname, &inst_bus);
+    else {
+        emit_substituted_format(out, format, ins, pin_nets, symname, NULL);
+        fputc('\n', out);
+    }
+
+    emit_save_current_line_if_requested(out, ins);
+
+    free(iname);
+    free(symname);
+    free(pin_nets);
+}
+
+static void emit_subckt_header(FILE *out, const xs_schematic *sch, const port_list *ports)
+{
+    fprintf(out, "** sch_path: %s\n", sch->path);
+    fprintf(out, ".subckt %s",        sch->cell_name);
+    for (int i = 0; i < ports->count; i++) fprintf(out, " %s", ports->names[i]);
+    fputc('\n', out);
+}
+
+static void emit_pininfo_line(FILE *out, const port_list *ports)
+{
+    fputs("*.PININFO", out);
+    for (int i = 0; i < ports->count; i++)
+        fprintf(out, " %s:%c", ports->names[i],
+                ports->kinds[i] ? ports->kinds[i] : 'B');
+    fputc('\n', out);
+}
+
+/* type=netlist_commands instances (`.control`, `.MODEL`, …) are deferred
+ * after the device list, matching XSCHEM's `**** begin user architecture
+ * code` section ordering. */
+static void emit_devices(FILE *out, const xs_schematic *sch,
+                         const connectivity_graph *g,
+                         const net_label_table *labels,
+                         int lvs_mode)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < sch->instance_count; i++) {
+            const xs_instance *ins = &sch->instances[i];
+            const xs_symbol   *sym = ins->resolved_symbol;
+            if (symbol_type_is_label_or_pin(sym->type)) continue;
+            int is_netlist_cmd = symbol_type_equals(sym->type, "netlist_commands");
+            if ((pass == 0 &&  is_netlist_cmd) ||
+                (pass == 1 && !is_netlist_cmd)) continue;
+            emit_one_device(out, ins, g, labels, i, lvs_mode);
+        }
+    }
+}
+
+static void emit_subckt_footer(FILE *out)
+{
+    fputs(".ends\n.end\n", out);
+}
+
+/* ============================================================ *
+ * Public entry point — assemble the SPICE netlist
+ * ============================================================ */
 
 int xs_netlister_emit_spice(xs_netlister *nl, const xs_schematic *sch, FILE *out)
 {
-    /* 1. Resolve symbols (caller must have called resolve_symbols). */
-    for (int i = 0; i < sch->ninstances; i++) {
-        if (!sch->instances[i].sym) {
+    for (int i = 0; i < sch->instance_count; i++) {
+        if (!sch->instances[i].resolved_symbol) {
             fprintf(stderr, "xschem2spice: instance %d (%s) has no resolved symbol\n",
                     i, sch->instances[i].symref);
             return -1;
         }
     }
 
-    /* 2. Build vertex list: every wire endpoint + every instance pin. */
-    int max_v = sch->nwires * 2;
-    for (int i = 0; i < sch->ninstances; i++) max_v += sch->instances[i].sym->npins;
-    vertex_t *V = xs_xmalloc(sizeof(vertex_t) * (size_t)(max_v + 1));
-    int nv = 0;
+    connectivity_graph graph;
+    build_connectivity_graph(&graph, sch);
 
-    /* per-instance pin-vertex offset (into V). */
-    int *inst_pin_off = xs_xmalloc(sizeof(int) * (size_t)(sch->ninstances + 1));
-    int *wire_a = xs_xmalloc(sizeof(int) * (size_t)(sch->nwires + 1));
-    int *wire_b = xs_xmalloc(sizeof(int) * (size_t)(sch->nwires + 1));
+    net_label_table labels;
+    net_label_table_init(&labels, graph.net_count);
+    apply_instance_label_pins(&labels, &graph, sch, nl->lvs_mode);
+    apply_bus_taps           (&labels, &graph, sch);
+    apply_auto_names_to_used_unlabeled_nets(&labels, &graph, sch);
 
-    for (int i = 0; i < sch->nwires; i++) {
-        const xs_wire *w = &sch->wires[i];
-        wire_a[i] = nv;
-        V[nv].x = w->x1; V[nv].y = w->y1; V[nv].inst = -1; V[nv].pin = -1;
-        nv++;
-        wire_b[i] = nv;
-        V[nv].x = w->x2; V[nv].y = w->y2; V[nv].inst = -1; V[nv].pin = -1;
-        nv++;
-    }
-    for (int i = 0; i < sch->ninstances; i++) {
-        inst_pin_off[i] = nv;
-        const xs_instance *ins = &sch->instances[i];
-        for (int j = 0; j < ins->sym->npins; j++) {
-            double gx, gy;
-            inst_pin_global(ins, j, &gx, &gy);
-            V[nv].x = gx; V[nv].y = gy; V[nv].inst = i; V[nv].pin = j;
-            nv++;
-        }
-    }
+    port_list ports;
+    port_list_init(&ports);
+    build_subckt_port_list(&ports, nl, sch);
 
-    /* 3. Union-find: same coord. */
-    ufd_t U;
-    U.n = nv;
-    U.parent = xs_xmalloc(sizeof(int) * (size_t)nv);
-    for (int i = 0; i < nv; i++) U.parent[i] = i;
+    emit_subckt_header(out, sch, &ports);
+    emit_pininfo_line (out, &ports);
+    emit_devices      (out, sch, &graph, &labels, nl->lvs_mode);
+    emit_subckt_footer(out);
 
-    /* coincident vertices */
-    for (int i = 0; i < nv; i++) {
-        for (int j = i + 1; j < nv; j++) {
-            if (dbleq(V[i].x, V[j].x) && dbleq(V[i].y, V[j].y)) {
-                uf_unite(&U, i, j);
-            }
-        }
-    }
-    /* type=short instances electrically merge their pins. */
-    for (int i = 0; i < sch->ninstances; i++) {
-        const xs_instance *ins = &sch->instances[i];
-        if (!ins->sym->type || strcmp(ins->sym->type, "short") != 0) continue;
-        if (ins->sym->npins < 2) continue;
-        int v0 = inst_pin_off[i] + 0;
-        for (int j = 1; j < ins->sym->npins; j++) {
-            uf_unite(&U, v0, inst_pin_off[i] + j);
-        }
-    }
-    /* wire interior contacts */
-    for (int wi = 0; wi < sch->nwires; wi++) {
-        const xs_wire *w = &sch->wires[wi];
-        /* both endpoints are already in V */
-        int a = wire_a[wi], b = wire_b[wi];
-        uf_unite(&U, a, b);
-        for (int v = 0; v < nv; v++) {
-            if (v == a || v == b) continue;
-            if (point_on_segment(V[v].x, V[v].y,
-                                 w->x1, w->y1, w->x2, w->y2)) {
-                uf_unite(&U, v, a);
-            }
-        }
-    }
-
-    /* 4. Build root -> compact net index */
-    int *root_idx = xs_xmalloc(sizeof(int) * (size_t)nv);
-    for (int i = 0; i < nv; i++) root_idx[i] = -1;
-    int nnets = 0;
-    for (int i = 0; i < nv; i++) {
-        int r = uf_find(&U, i);
-        if (root_idx[r] == -1) root_idx[r] = nnets++;
-    }
-    char **net_label = xs_xmalloc(sizeof(char *) * (size_t)(nnets + 1));
-    /* Priority of the current label per net:
-     *   3 = port label (ipin/opin/iopin) — must appear in .subckt port list
-     *   2 = lab_pin or other label-typed instance
-     *   1 = wire lab= annotation
-     *   0 = none (use auto-name)
-     * Higher priority wins; on equal priority, alphabetically-earlier wins
-     * for determinism. */
-    int *net_label_prio = xs_xmalloc(sizeof(int) * (size_t)(nnets + 1));
-    for (int i = 0; i < nnets; i++) {
-        net_label[i] = NULL;
-        net_label_prio[i] = 0;
-    }
-
-    /* Apply labels from ipin/opin/iopin/label-typed instances.
-     *
-     * Note: xschem does NOT treat the wire-level `lab=NAME` annotation as
-     * authoritative — those values are cached annotations from a prior
-     * netlist run. Authoritative names come exclusively from instance pins
-     * (lab_pin / ipin / opin / iopin / lab_wire). Trying to propagate them
-     * here causes false-merges of nets that xschem keeps distinct. */
-    for (int i = 0; i < sch->ninstances; i++) {
-        const xs_instance *ins = &sch->instances[i];
-        if (!is_label_type(ins->sym->type)) continue;
-        int pinix = label_pin_index(ins->sym);
-        if (pinix < 0) continue;
-        int v = inst_pin_off[i] + pinix;
-        int net = root_idx[uf_find(&U, v)];
-        char *lab = xs_prop_get(ins->prop, "lab");
-        if (!lab) continue;
-        char *pretty = prettify_label(lab, nl->lvs_mode);
-        free(lab);
-        int prio = is_port_type(ins->sym->type) ? 3 : 2;
-        if (net_label_prio[net] < prio ||
-            (net_label_prio[net] == prio && net_label[net] &&
-             strcmp(net_label[net], pretty) > 0)) {
-            free(net_label[net]);
-            net_label[net] = pretty;
-            net_label_prio[net] = prio;
-        } else {
-            free(pretty);
-        }
-    }
-
-    /* 5c. Process bus_tap instances. A bus_tap symbol has two pins:
-     *
-     *   pin 0 (`tap`)  — scalar net side
-     *   pin 1 (`bus`)  — bus net side; e.g. carries `DATA[15:0]`
-     *
-     * The instance carries `lab=[<bit>]`. xschem derives the tap-side
-     * scalar name as <basename>[<bit>], where <basename> is taken from the
-     * bus pin's resolved net (e.g. `DATA` from `DATA[15:0]`). This is what
-     * lets a wire labelled by a `lab_pin` `lab=DATA[15:0]` translate to a
-     * scalar `DATA[3]` net at the tap pin (which downstream instances then
-     * reference). */
-    for (int i = 0; i < sch->ninstances; i++) {
-        const xs_instance *ins = &sch->instances[i];
-        if (!ins->sym->type || strcmp(ins->sym->type, "bus_tap") != 0) continue;
-        if (ins->sym->npins < 2) continue;
-
-        /* Identify which pin is "tap" (scalar) and which is "bus" by name.
-         * Default to the convention from xschem's bus_tap.sym (tap=0, bus=1)
-         * if names are missing. */
-        int tap_idx = 0, bus_idx = 1;
-        for (int j = 0; j < ins->sym->npins; j++) {
-            const char *nm = ins->sym->pins[j].name;
-            if (!nm) continue;
-            if (strcmp(nm, "tap") == 0) tap_idx = j;
-            else if (strcmp(nm, "bus") == 0) bus_idx = j;
-        }
-
-        int v_bus = inst_pin_off[i] + bus_idx;
-        int v_tap = inst_pin_off[i] + tap_idx;
-        int net_bus = root_idx[uf_find(&U, v_bus)];
-        int net_tap = root_idx[uf_find(&U, v_tap)];
-        const char *bus_name = net_label[net_bus];
-        if (!bus_name) continue;  /* bus side unnamed; can't derive scalar */
-
-        /* tap is the per-instance lab, e.g. "[3]" or "ENAB". */
-        char *tap_lab = xs_prop_get(ins->prop, "lab");
-        if (!tap_lab) {
-            /* fall back to the symbol template's default */
-            if (ins->sym->template_)
-                tap_lab = xs_prop_get(ins->sym->template_, "lab");
-        }
-        if (!tap_lab || !*tap_lab) { free(tap_lab); continue; }
-
-        /* xschem's rule (xschem/src/netlist.c instcheck): if the tap label
-         * starts with `[` or is purely digits, treat it as a bit/range slice
-         * of the bus's basename; otherwise the tap label is the literal net
-         * name. */
-        int is_slice = (tap_lab[0] == '[');
-        if (!is_slice) {
-            int onlydigits = 1;
-            for (const char *q = tap_lab; *q; q++) {
-                if (!isdigit((unsigned char)*q)) { onlydigits = 0; break; }
-            }
-            is_slice = onlydigits;
-        }
-
-        char *scalar;
-        if (is_slice) {
-            /* Find the basename xschem-style: walk left from the first `[`
-             * until we hit a `,` (or the start of the string), then skip
-             * any leading spaces. Lets us extract `ADD` from a comma-list
-             * bus name like `CK , S1, ADD[3:0], ENAB`. */
-            const char *first_lb = strchr(bus_name, '[');
-            const char *base_start;
-            if (first_lb) {
-                const char *p2 = first_lb;
-                while (p2 > bus_name) {
-                    p2--;
-                    if (*p2 == ',') {
-                        do { p2++; } while (*p2 == ' ');
-                        break;
-                    }
-                }
-                if (*p2 == ',' || p2 < bus_name) p2 = bus_name;
-                base_start = p2;
-            } else {
-                base_start = bus_name;
-            }
-            const char *base_end = first_lb ? first_lb : (bus_name + strlen(bus_name));
-            size_t base_len = (size_t)(base_end - base_start);
-            size_t scalar_len = base_len + strlen(tap_lab);
-            scalar = xs_xmalloc(scalar_len + 1);
-            memcpy(scalar, base_start, base_len);
-            memcpy(scalar + base_len, tap_lab, strlen(tap_lab));
-            scalar[scalar_len] = '\0';
-        } else {
-            scalar = xs_strdup(tap_lab);
-        }
-        free(tap_lab);
-
-        /* Assign with the same priority as a lab_pin (2). Bus_tap is the
-         * authoritative source of scalar net names derived from buses. */
-        const int prio = 2;
-        if (net_label_prio[net_tap] < prio ||
-            (net_label_prio[net_tap] == prio && net_label[net_tap] &&
-             strcmp(net_label[net_tap], scalar) > 0)) {
-            free(net_label[net_tap]);
-            net_label[net_tap] = scalar;
-            net_label_prio[net_tap] = prio;
-        } else {
-            free(scalar);
-        }
-    }
-
-    /* 6. Generate auto names for unlabeled nets that are actually used.
-     *    A net is "used" if at least one non-label instance pin connects to it.
-     */
-    int *net_used = xs_xmalloc(sizeof(int) * (size_t)nnets);
-    for (int i = 0; i < nnets; i++) net_used[i] = 0;
-    for (int i = 0; i < sch->ninstances; i++) {
-        const xs_instance *ins = &sch->instances[i];
-        if (is_label_type(ins->sym->type)) continue;
-        for (int j = 0; j < ins->sym->npins; j++) {
-            int v = inst_pin_off[i] + j;
-            int net = root_idx[uf_find(&U, v)];
-            net_used[net] = 1;
-        }
-    }
-    int auto_n = 0;
-    for (int i = 0; i < nnets; i++) {
-        if (net_label[i] || !net_used[i]) continue;
-        auto_n++;
-        char buf[32];
-        snprintf(buf, sizeof buf, "net%d", auto_n);
-        net_label[i] = xs_strdup(buf);
-    }
-
-    /* 7. Determine port list. Preferred source: companion <cell>.sym's
-     *    B-record pin order (with bus-name expansion). xschem creates symbols
-     *    from schematics with this ordering convention, and the parent's
-     *    instance-level pinlist substitution depends on it — so the .subckt
-     *    line must match the .sym's pin order, not the .sch's ipin order. */
-    int  ports_cap = sch->ninstances + 16;
-    char **port_names = xs_xmalloc(sizeof(char *) * (size_t)ports_cap);
-    char **port_kinds = xs_xmalloc(sizeof(char *) * (size_t)ports_cap);
-    int nports = 0;
-
-    xs_symbol *self_sym = xs_netlister_self_symbol(nl, sch);
-    /* Build a map from port name -> kind ("ipin"/"opin"/"iopin") from the
-     * schematic's own ipin/opin instances, so we can produce a PININFO line
-     * even when the .sym drives the port list. */
-    typedef struct { char *name; char kind; } portkind_t;
-    portkind_t *pks = xs_xmalloc(sizeof(portkind_t) * (size_t)(sch->ninstances + 1));
-    int npks = 0;
-    for (int i = 0; i < sch->ninstances; i++) {
-        const xs_instance *ins = &sch->instances[i];
-        if (!ins->sym->type) continue;
-        if (!is_port_type(ins->sym->type)) continue;
-        char *lab = xs_prop_get(ins->prop, "lab");
-        if (!lab || !*lab) { free(lab); continue; }
-        char *pretty = prettify_label(lab, nl->lvs_mode);
-        free(lab);
-        char k = (strcmp(ins->sym->type, "ipin") == 0) ? 'I' :
-                 (strcmp(ins->sym->type, "opin") == 0) ? 'O' : 'B';
-        pks[npks].name = pretty;
-        pks[npks].kind = k;
-        npks++;
-    }
-
-    if (self_sym && self_sym->npins > 0) {
-        /* Use .sym pin order, expanding bus names like "A[3:0]" or "A[3..0]" */
-        for (int i = 0; i < self_sym->npins; i++) {
-            const char *nm = self_sym->pins[i].name;
-            if (!nm) continue;
-            /* Check for bus form: "<base>[<hi>:<lo>]" or "<base>[<hi>..<lo>]" */
-            const char *lb = strchr(nm, '[');
-            const char *colon = NULL;
-            const char *rb = NULL;
-            int hi = 0, lo = 0, is_bus = 0;
-            if (lb) {
-                rb = strchr(lb, ']');
-                colon = strchr(lb, ':');
-                const char *dotdot = strstr(lb, "..");
-                if (rb && colon && colon < rb) {
-                    is_bus = sscanf(lb, "[%d:%d]", &hi, &lo) == 2;
-                } else if (rb && dotdot && dotdot < rb) {
-                    is_bus = sscanf(lb, "[%d..%d]", &hi, &lo) == 2;
-                }
-            }
-            if (is_bus) {
-                size_t base_len = (size_t)(lb - nm);
-                int step = (hi >= lo) ? -1 : 1;
-                int n = (hi >= lo) ? (hi - lo + 1) : (lo - hi + 1);
-                int kind = (colon && colon < rb) ? XS_BUS_COLON : XS_BUS_DOTDOT;
-                for (int k = 0; k < n; k++) {
-                    int idx = hi + step * k;
-                    char buf[256];
-                    render_bus_scalar(buf, sizeof buf, nm, base_len, idx, kind);
-                    int dup = 0;
-                    for (int p = 0; p < nports; p++)
-                        if (strcmp(port_names[p], buf) == 0) { dup = 1; break; }
-                    if (dup) continue;
-                    if (nports >= ports_cap) {
-                        ports_cap *= 2;
-                        port_names = xs_xrealloc(port_names,
-                                                 sizeof(char *) * (size_t)ports_cap);
-                        port_kinds = xs_xrealloc(port_kinds,
-                                                 sizeof(char *) * (size_t)ports_cap);
-                    }
-                    port_names[nports] = xs_strdup(buf);
-                    port_kinds[nports] = NULL;
-                    nports++;
-                }
-            } else {
-                int dup = 0;
-                for (int p = 0; p < nports; p++)
-                    if (strcmp(port_names[p], nm) == 0) { dup = 1; break; }
-                if (dup) continue;
-                if (nports >= ports_cap) {
-                    ports_cap *= 2;
-                    port_names = xs_xrealloc(port_names,
-                                             sizeof(char *) * (size_t)ports_cap);
-                    port_kinds = xs_xrealloc(port_kinds,
-                                             sizeof(char *) * (size_t)ports_cap);
-                }
-                port_names[nports] = xs_strdup(nm);
-                port_kinds[nports] = NULL;
-                nports++;
-            }
-        }
-    } else {
-        /* Fallback: ipins, opins, iopins in source order. */
-        for (int pass = 0; pass < 3; pass++) {
-            const char *want = (pass == 0) ? "ipin" : (pass == 1) ? "opin" : "iopin";
-            for (int i = 0; i < sch->ninstances; i++) {
-                const xs_instance *ins = &sch->instances[i];
-                if (!ins->sym->type) continue;
-                if (strcmp(ins->sym->type, want) != 0) continue;
-                char *lab = xs_prop_get(ins->prop, "lab");
-                if (!lab || !*lab) { free(lab); continue; }
-                char *pretty = prettify_label(lab, nl->lvs_mode);
-                free(lab);
-                int dup = 0;
-                for (int j = 0; j < nports; j++) {
-                    if (strcmp(port_names[j], pretty) == 0) { dup = 1; break; }
-                }
-                if (dup) { free(pretty); continue; }
-                if (nports >= ports_cap) {
-                    ports_cap *= 2;
-                    port_names = xs_xrealloc(port_names,
-                                             sizeof(char *) * (size_t)ports_cap);
-                    port_kinds = xs_xrealloc(port_kinds,
-                                             sizeof(char *) * (size_t)ports_cap);
-                }
-                port_names[nports] = pretty;
-                port_kinds[nports] = NULL;
-                nports++;
-            }
-        }
-    }
-    /* Annotate kinds */
-    for (int p = 0; p < nports; p++) {
-        for (int k = 0; k < npks; k++) {
-            if (strcmp(port_names[p], pks[k].name) == 0) {
-                static char buf[2][2] = {{'I',0},{'O',0}};
-                (void)buf;
-                char *s = xs_xmalloc(2);
-                s[0] = pks[k].kind; s[1] = '\0';
-                port_kinds[p] = s;
-                break;
-            }
-        }
-    }
-    for (int k = 0; k < npks; k++) free(pks[k].name);
-    free(pks);
-
-    /* 8. Emit SPICE */
-    fprintf(out, "** sch_path: %s\n", sch->path);
-    fprintf(out, ".subckt %s", sch->cell_name);
-    for (int i = 0; i < nports; i++) {
-        fprintf(out, " %s", port_names[i]);
-    }
-    fprintf(out, "\n");
-
-    /* PININFO line */
-    fprintf(out, "*.PININFO");
-    for (int i = 0; i < nports; i++) {
-        char k = port_kinds[i] ? port_kinds[i][0] : 'B';
-        fprintf(out, " %s:%c", port_names[i], k);
-    }
-    fprintf(out, "\n");
-
-    /* Body: emit each non-port, non-label instance's format.
-     * Skip instances whose effective spice_ignore is "true". Defer
-     * type=netlist_commands instances (.control blocks etc.) to after
-     * the device list. */
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < sch->ninstances; i++) {
-            const xs_instance *ins = &sch->instances[i];
-            if (is_label_type(ins->sym->type)) continue;
-
-            int is_netlist_cmd = (ins->sym->type &&
-                                  strcmp(ins->sym->type, "netlist_commands") == 0);
-            if (pass == 0 && is_netlist_cmd) continue;
-            if (pass == 1 && !is_netlist_cmd) continue;
-
-            /* spice_ignore truthy → skip this device. Truthy values
-             * mirror xschem's `strboolcmp`: "true", "1", "yes" etc. The
-             * special value "short" is also a skip-with-comment. Symbol-
-             * level spice_ignore (in the K block) applies to every instance
-             * unless the instance explicitly overrides it. */
-            char *si = xs_prop_get(ins->prop, "spice_ignore");
-            if (!si && ins->sym->spice_ignore)
-                si = xs_strdup(ins->sym->spice_ignore);
-            int ignore = 0;
-            if (si) {
-                if (strcmp(si, "true") == 0 || strcmp(si, "short") == 0 ||
-                    strcmp(si, "1") == 0    || strcmp(si, "yes") == 0)
-                    ignore = 1;
-            }
-            free(si);
-            if (ignore) continue;
-
-            /* For type=subcircuit instances we don't recurse — xschem emits
-             * a placeholder comment in this case (`* <name> - <sym> IS
-             * MISSING !!!!`). Match that exactly so netgen LVS sees the same
-             * top-level graph. */
-            if (ins->sym->type && strcmp(ins->sym->type, "subcircuit") == 0) {
-                char *iname = xs_prop_get(ins->prop, "name");
-                char *sn = symbol_short_name(ins->symref);
-                fprintf(out, "*  %s -  %s  IS MISSING !!!!\n",
-                        iname ? iname : "?", sn ? sn : "?");
-                free(iname);
-                free(sn);
-                continue;
-            }
-
-            const char *fmt = NULL;
-            if (nl->lvs_mode && ins->sym->lvs_format && *ins->sym->lvs_format)
-                fmt = ins->sym->lvs_format;
-            else if (ins->sym->format && *ins->sym->format)
-                fmt = ins->sym->format;
-            if (!fmt) {
-                /* informational only; not all symbols emit netlist content */
-                continue;
-            }
-
-            char **pin_nets = xs_xmalloc(sizeof(char *) *
-                                         (size_t)(ins->sym->npins + 1));
-            for (int j = 0; j < ins->sym->npins; j++) {
-                int v = inst_pin_off[i] + j;
-                int net = root_idx[uf_find(&U, v)];
-                pin_nets[j] = net_label[net];
-            }
-            char *symshort = symbol_short_name(ins->symref);
-
-            /* Bus-name instance expansion: when an instance is named like
-             * "R5[3:0]", xschem emits 4 separate device lines (R5[3], R5[2],
-             * R5[1], R5[0]) — and for any pin that connects to an equally-
-             * sized bus net (e.g. DATA[3:0] or DATA[15:12]), each replica
-             * gets the matching scalar bit. Replica iteration goes from hi
-             * to lo, matching xschem. */
-            char *iname = xs_prop_get(ins->prop, "name");
-            int inst_hi = 0, inst_lo = 0, inst_kind = XS_BUS_NONE;
-            size_t inst_base_len = 0;
-            int inst_mult = iname ? parse_bus_name(iname, &inst_base_len,
-                                                   &inst_hi, &inst_lo,
-                                                   &inst_kind) : 0;
-            if (inst_mult <= 1) {
-                emit_subst_format(fmt, ins, pin_nets, symshort, out);
-                fputc('\n', out);
-            } else {
-                int step = (inst_hi >= inst_lo) ? -1 : 1;
-                /* Pre-parse each pin's net to detect bus form. */
-                int *pin_mult = xs_xmalloc(sizeof(int)    * (size_t)ins->sym->npins);
-                int *pin_hi   = xs_xmalloc(sizeof(int)    * (size_t)ins->sym->npins);
-                int *pin_lo   = xs_xmalloc(sizeof(int)    * (size_t)ins->sym->npins);
-                int *pin_kind = xs_xmalloc(sizeof(int)    * (size_t)ins->sym->npins);
-                size_t *pbl   = xs_xmalloc(sizeof(size_t) * (size_t)ins->sym->npins);
-                for (int j = 0; j < ins->sym->npins; j++) {
-                    pin_mult[j] = pin_nets[j] ?
-                        parse_bus_name(pin_nets[j], &pbl[j],
-                                       &pin_hi[j], &pin_lo[j], &pin_kind[j]) : 0;
-                }
-                char **rep_nets = xs_xmalloc(sizeof(char *) * (size_t)ins->sym->npins);
-                for (int k = 0; k < inst_mult; k++) {
-                    int bit = inst_hi + step * k;
-                    char rep_name[256];
-                    render_bus_scalar(rep_name, sizeof rep_name, iname,
-                                      inst_base_len, bit, inst_kind);
-                    /* Per-replica pin nets */
-                    for (int j = 0; j < ins->sym->npins; j++) {
-                        if (pin_mult[j] == inst_mult) {
-                            int pstep = (pin_hi[j] >= pin_lo[j]) ? -1 : 1;
-                            int pbit = pin_hi[j] + pstep * k;
-                            char buf[256];
-                            render_bus_scalar(buf, sizeof buf, pin_nets[j],
-                                              pbl[j], pbit, pin_kind[j]);
-                            rep_nets[j] = xs_strdup(buf);
-                        } else {
-                            rep_nets[j] = NULL;  /* signal to use original */
-                        }
-                    }
-                    /* Build a temporary pin_nets array with overrides. */
-                    char **rpn = xs_xmalloc(sizeof(char *) * (size_t)ins->sym->npins);
-                    for (int j = 0; j < ins->sym->npins; j++) {
-                        rpn[j] = rep_nets[j] ? rep_nets[j] : pin_nets[j];
-                    }
-                    emit_subst_format_one(fmt, ins, rpn, symshort, rep_name, out);
-                    fputc('\n', out);
-                    for (int j = 0; j < ins->sym->npins; j++) free(rep_nets[j]);
-                    free(rpn);
-                }
-                free(pin_mult);
-                free(pin_hi);
-                free(pin_lo);
-                free(pin_kind);
-                free(pbl);
-                free(rep_nets);
-            }
-            free(iname);
-
-            /* If the instance has savecurrent=true (or symbol template default
-             * resolves to true), emit a .save line — this matches xschem's
-             * behavior for vsource/ammeter when savecurrent is enabled. */
-            char *sc = get_resolved_prop(ins, "savecurrent");
-            if (sc && strcmp(sc, "true") == 0) {
-                char *iname2 = xs_prop_get(ins->prop, "name");
-                if (iname2 && *iname2) {
-                    /* lower-case name for SPICE i(...) */
-                    fputs(".save i(", out);
-                    for (char *q = iname2; *q; q++) fputc(tolower((unsigned char)*q), out);
-                    fputs(")\n", out);
-                }
-                free(iname2);
-            }
-            free(sc);
-            free(symshort);
-            free(pin_nets);
-        }
-    }
-
-    fprintf(out, ".ends\n");
-    fprintf(out, ".end\n");
-
-    /* cleanup */
-    for (int i = 0; i < nnets; i++) free(net_label[i]);
-    free(net_label);
-    free(net_label_prio);
-    free(net_used);
-    for (int i = 0; i < nports; i++) {
-        free(port_names[i]);
-        free(port_kinds[i]);
-    }
-    free(port_names);
-    free(port_kinds);
-    free(root_idx);
-    free(U.parent);
-    free(wire_a);
-    free(wire_b);
-    free(inst_pin_off);
-    free(V);
+    port_list_free(&ports);
+    net_label_table_free(&labels);
+    free_connectivity_graph(&graph);
     return 0;
+}
+
+int xs_write_spice_netlist(const char *schematic_path,
+                           const char *xschemrc_path,
+                           FILE       *out)
+{
+    xs_library_path library_path;
+    xs_library_path_init(&library_path);
+    if (xschemrc_path)
+        xs_library_path_load_xschemrc(&library_path, xschemrc_path);
+
+    xs_schematic schematic;
+    if (xs_parse_schematic(schematic_path, &schematic) != 0) {
+        xs_library_path_free(&library_path);
+        return -1;
+    }
+
+    xs_netlister netlister;
+    xs_netlister_init(&netlister, &library_path, /*lvs_mode=*/1);
+
+    int status = xs_netlister_resolve_symbols(&netlister, &schematic);
+    if (status == 0) status = xs_netlister_emit_spice(&netlister, &schematic, out);
+
+    xs_netlister_free(&netlister);
+    xs_free_schematic(&schematic);
+    xs_library_path_free(&library_path);
+    return status;
 }

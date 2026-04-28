@@ -1,27 +1,48 @@
+/*
+ * xschem2spice - a headless C tool that converts xschem .sch/.sym files into SPICE netlists
+ * Copyright (C) 2026 Ethan Sifferman
+ *
+ * Portions of this file are derived from xschem
+ * Copyright (C) 1998-2021 Stefan Frederik Schippers
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, see <https://www.gnu.org/licenses/>.
+ */
+
 #include "strutil.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-void *xs_xmalloc(size_t n)
+void *xs_xmalloc(size_t bytes)
 {
-    void *p = malloc(n ? n : 1);
+    void *p = malloc(bytes ? bytes : 1);
     if (!p) {
-        fprintf(stderr, "xschem2spice: out of memory (malloc %zu)\n", n);
+        fprintf(stderr, "xschem2spice: out of memory (malloc %zu)\n", bytes);
         exit(2);
     }
     return p;
 }
 
-void *xs_xrealloc(void *p, size_t n)
+void *xs_xrealloc(void *ptr, size_t bytes)
 {
-    void *q = realloc(p, n ? n : 1);
-    if (!q) {
-        fprintf(stderr, "xschem2spice: out of memory (realloc %zu)\n", n);
+    void *p = realloc(ptr, bytes ? bytes : 1);
+    if (!p) {
+        fprintf(stderr, "xschem2spice: out of memory (realloc %zu)\n", bytes);
         exit(2);
     }
-    return q;
+    return p;
 }
 
 char *xs_strdup(const char *s)
@@ -41,89 +62,66 @@ char *xs_strndup(const char *s, size_t n)
     return r;
 }
 
-void xs_str_init(xs_str *s)
+void xs_string_buffer_init(xs_string_buffer *b)
 {
-    s->buf = NULL;
-    s->len = 0;
-    s->cap = 0;
+    b->buffer   = NULL;
+    b->length   = 0;
+    b->capacity = 0;
 }
 
-void xs_str_free(xs_str *s)
+void xs_string_buffer_free(xs_string_buffer *b)
 {
-    free(s->buf);
-    s->buf = NULL;
-    s->len = 0;
-    s->cap = 0;
+    free(b->buffer);
+    b->buffer   = NULL;
+    b->length   = 0;
+    b->capacity = 0;
 }
 
-void xs_str_clear(xs_str *s)
+static void xs_string_buffer_reserve(xs_string_buffer *b, size_t additional)
 {
-    s->len = 0;
-    if (s->buf) s->buf[0] = '\0';
+    if (b->length + additional + 1 <= b->capacity) return;
+    size_t new_capacity = b->capacity ? b->capacity : 64;
+    while (b->length + additional + 1 > new_capacity) new_capacity *= 2;
+    b->buffer   = xs_xrealloc(b->buffer, new_capacity);
+    b->capacity = new_capacity;
 }
 
-static void xs_str_grow(xs_str *s, size_t need)
+void xs_string_buffer_append_char(xs_string_buffer *b, char c)
 {
-    if (s->len + need + 1 <= s->cap) return;
-    size_t nc = s->cap ? s->cap : 64;
-    while (s->len + need + 1 > nc) nc *= 2;
-    s->buf = xs_xrealloc(s->buf, nc);
-    s->cap = nc;
+    xs_string_buffer_reserve(b, 1);
+    b->buffer[b->length++] = c;
+    b->buffer[b->length]   = '\0';
 }
 
-void xs_str_putc(xs_str *s, char c)
+void xs_string_buffer_append(xs_string_buffer *b, const char *s)
 {
-    xs_str_grow(s, 1);
-    s->buf[s->len++] = c;
-    s->buf[s->len] = '\0';
+    if (s) xs_string_buffer_append_n(b, s, strlen(s));
 }
 
-void xs_str_puts(xs_str *s, const char *t)
+void xs_string_buffer_append_n(xs_string_buffer *b, const char *s, size_t n)
 {
-    if (!t) return;
-    size_t n = strlen(t);
-    xs_str_putn(s, t, n);
+    xs_string_buffer_reserve(b, n);
+    memcpy(b->buffer + b->length, s, n);
+    b->length += n;
+    b->buffer[b->length] = '\0';
 }
 
-void xs_str_putn(xs_str *s, const char *t, size_t n)
+void xs_string_buffer_appendf(xs_string_buffer *b, const char *fmt, ...)
 {
-    xs_str_grow(s, n);
-    memcpy(s->buf + s->len, t, n);
-    s->len += n;
-    s->buf[s->len] = '\0';
-}
-
-void xs_str_printf(xs_str *s, const char *fmt, ...)
-{
-    char buf[1024];
+    char small[1024];
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    int n = vsnprintf(small, sizeof small, fmt, ap);
     va_end(ap);
     if (n < 0) return;
-    if ((size_t)n < sizeof buf) {
-        xs_str_putn(s, buf, (size_t)n);
+    if ((size_t)n < sizeof small) {
+        xs_string_buffer_append_n(b, small, (size_t)n);
         return;
     }
     char *big = xs_xmalloc((size_t)n + 1);
     va_start(ap, fmt);
     vsnprintf(big, (size_t)n + 1, fmt, ap);
     va_end(ap);
-    xs_str_putn(s, big, (size_t)n);
+    xs_string_buffer_append_n(b, big, (size_t)n);
     free(big);
-}
-
-int xs_str_endswith(const char *s, const char *suffix)
-{
-    if (!s || !suffix) return 0;
-    size_t ls = strlen(s), lsx = strlen(suffix);
-    if (lsx > ls) return 0;
-    return strcmp(s + ls - lsx, suffix) == 0;
-}
-
-int xs_str_startswith(const char *s, const char *prefix)
-{
-    if (!s || !prefix) return 0;
-    size_t lp = strlen(prefix);
-    return strncmp(s, prefix, lp) == 0;
 }

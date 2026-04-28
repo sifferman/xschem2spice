@@ -76,6 +76,6 @@ jobs:
         run: |
           make
 
-      - name: LVS
+      - name: Run tests
         run: |
           make test XSCHEM_EXAMPLES=1

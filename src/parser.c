@@ -1,451 +1,408 @@
+/*
+ * xschem2spice - a headless C tool that converts xschem .sch/.sym files into SPICE netlists
+ * Copyright (C) 2026 Ethan Sifferman
+ *
+ * Portions of this file are derived from xschem
+ * Copyright (C) 1998-2021 Stefan Frederik Schippers
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, see <https://www.gnu.org/licenses/>.
+ */
+
+/*
+ * On-disk format mirrors XSCHEM's per-record reader/writer (both live in
+ * src/save.c despite the name):
+ *   read_xschem_file():
+ *     https://github.com/StefanSchippers/xschem/blob/3.4.7/src/save.c#L3058-L3202
+ *   write_xschem_file():
+ *     https://github.com/StefanSchippers/xschem/blob/3.4.7/src/save.c#L2705-L2759
+ */
+
 #include "parser.h"
 #include "strutil.h"
 
 #include <ctype.h>
+#include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* ---------------- file slurp ---------------- */
 
-static char *slurp(const char *path, size_t *out_len)
+static char *read_entire_file(const char *path, size_t *out_length)
 {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (n < 0) { fclose(f); return NULL; }
-    char *buf = xs_xmalloc((size_t)n + 1);
-    size_t got = fread(buf, 1, (size_t)n, f);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = xs_xmalloc((size_t)size + 1);
+    size_t got = fread(buf, 1, (size_t)size, f);
     buf[got] = '\0';
     fclose(f);
-    if (out_len) *out_len = got;
+    if (out_length) *out_length = got;
     return buf;
 }
 
 /* ---------------- tokenizer ---------------- */
 
 typedef struct {
-    const char *p;       /* current pointer */
-    const char *end;     /* one past end */
-    const char *path;    /* for error msgs */
-    int line;
-} tok_t;
+    const char *cursor;
+    const char *end;
+    const char *file_path;
+    int         line_number;
+} parse_cursor;
 
-static void tok_init(tok_t *t, const char *buf, size_t len, const char *path)
+static void cursor_init(parse_cursor *p, const char *buf, size_t length, const char *path)
 {
-    t->p = buf;
-    t->end = buf + len;
-    t->path = path;
-    t->line = 1;
+    p->cursor      = buf;
+    p->end         = buf + length;
+    p->file_path   = path;
+    p->line_number = 1;
 }
 
-static int tok_eof(tok_t *t) { return t->p >= t->end; }
+static int cursor_eof(const parse_cursor *p) { return p->cursor >= p->end; }
 
-static void tok_skip_ws(tok_t *t)
+static void skip_whitespace(parse_cursor *p)
 {
-    while (t->p < t->end) {
-        char c = *t->p;
-        if (c == ' ' || c == '\t' || c == '\r') { t->p++; continue; }
-        if (c == '\n') { t->line++; t->p++; continue; }
+    while (p->cursor < p->end) {
+        char c = *p->cursor;
+        if (c == '\n') { p->line_number++; p->cursor++; continue; }
+        if (c == ' ' || c == '\t' || c == '\r') { p->cursor++; continue; }
         break;
     }
 }
 
-/* Skip whitespace including newlines until we see start of next record. */
-static int tok_peek_record_start(tok_t *t)
+static int peek_record_tag(parse_cursor *p)
 {
-    tok_skip_ws(t);
-    if (tok_eof(t)) return -1;
-    return (unsigned char)*t->p;
+    skip_whitespace(p);
+    if (cursor_eof(p)) return -1;
+    return (unsigned char)*p->cursor;
 }
 
-/* Read a numeric token (double). Whitespace-skipped first. */
-static int tok_number(tok_t *t, double *out)
+static int read_required_double_token(parse_cursor *p, double *out)
 {
-    tok_skip_ws(t);
-    if (tok_eof(t)) return -1;
+    skip_whitespace(p);
+    if (cursor_eof(p)) return -1;
     char *end;
-    double v = strtod(t->p, &end);
-    if (end == t->p) return -1;
-    t->p = end;
+    double v = strtod(p->cursor, &end);
+    if (end == p->cursor) return -1;
+    p->cursor = end;
     *out = v;
     return 0;
 }
 
-static int tok_int(tok_t *t, int *out)
+static int read_required_integer_token(parse_cursor *p, int *out)
 {
     double v;
-    if (tok_number(t, &v) != 0) return -1;
+    if (read_required_double_token(p, &v) != 0) return -1;
     *out = (int)v;
     return 0;
 }
 
-/*
- * Read a brace-delimited block. Skip whitespace; expect '{'.
- * Returns malloc'd contents (without the outer braces).
- * Inside, count balance of '{' and '}', honor '\\', '\{', '\}'.
- * (xschem uses Tcl-like list semantics; this approximation suffices
- *  for the records we care about.)
- */
-static char *tok_brace(tok_t *t)
+/* Read a `{...}` block. Brace balance is honoured; `\\` escapes the next
+ * character (so `\}` doesn't close the block). Returns a malloc'd copy of
+ * the block contents (without outer braces) or NULL on syntax error. */
+static char *read_brace_block(parse_cursor *p)
 {
-    tok_skip_ws(t);
-    if (tok_eof(t) || *t->p != '{') return NULL;
-    t->p++;                       /* consume '{' */
-    const char *start = t->p;
+    skip_whitespace(p);
+    if (cursor_eof(p) || *p->cursor != '{') return NULL;
+    p->cursor++;
+    const char *start = p->cursor;
     int depth = 1;
-    while (t->p < t->end && depth > 0) {
-        char c = *t->p;
-        if (c == '\\' && t->p + 1 < t->end) {
-            if (t->p[1] == '\n') t->line++;
-            t->p += 2;
+    while (p->cursor < p->end && depth > 0) {
+        char c = *p->cursor;
+        if (c == '\\' && p->cursor + 1 < p->end) {
+            if (p->cursor[1] == '\n') p->line_number++;
+            p->cursor += 2;
             continue;
         }
         if (c == '{') depth++;
         else if (c == '}') { depth--; if (depth == 0) break; }
-        else if (c == '\n') t->line++;
-        t->p++;
+        else if (c == '\n') p->line_number++;
+        p->cursor++;
     }
     if (depth != 0) return NULL;
-    size_t n = (size_t)(t->p - start);
-    char *r = xs_strndup(start, n);
-    t->p++;                       /* consume final '}' */
-    return r;
+    char *contents = xs_strndup(start, (size_t)(p->cursor - start));
+    p->cursor++;
+    return contents;
 }
 
-/* Skip a brace-delimited block. */
-static int tok_skip_brace(tok_t *t)
+static int skip_brace_block(parse_cursor *p)
 {
-    char *s = tok_brace(t);
+    char *s = read_brace_block(p);
     if (!s) return -1;
     free(s);
     return 0;
 }
 
-/* Skip rest of line (used to skip records we don't care about whose syntax
- * we don't fully parse — but we DO need to consume their brace block.) */
-
-/* ---------------- property block parsing ---------------- */
-
+/* ---------------- key=value property parsing ---------------- */
 /*
- * The property block format is a Tcl-list-ish "key=value key=value ..." —
- * key is alnum/underscore, value is bare token (no whitespace) OR a
- * "..."-quoted string with \" / \\ escapes. Separators are whitespace
- * (incl. newlines).
- *
- * xs_prop_get returns a malloc'd, escape-decoded copy of the value or NULL.
+ * Mirrors get_tok_value() in xschem
+ *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/token.c#L438-L532
+ * (we accept the same tokens it produces; full Tcl-list-style nesting is not
+ * needed for any record we care about).
  */
-char *xs_prop_get(const char *prop, const char *key)
+char *xs_prop_get(const char *property_block, const char *key)
 {
-    if (!prop || !key) return NULL;
-    size_t klen = strlen(key);
-    const char *p = prop;
-    while (*p) {
-        /* skip whitespace */
-        while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-            p++;
+    if (!property_block || !key) return NULL;
+    size_t key_length = strlen(key);
+
+    for (const char *p = property_block; *p; ) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
         if (!*p) break;
-        /* read key */
-        const char *kstart = p;
+
+        const char *current_key_start = p;
         while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
-        size_t curkl = (size_t)(p - kstart);
-        int matched = (curkl == klen && memcmp(kstart, key, klen) == 0);
-        /* skip optional '=' */
+        size_t current_key_length = (size_t)(p - current_key_start);
+        int    is_match = (current_key_length == key_length &&
+                           memcmp(current_key_start, key, key_length) == 0);
+
         if (*p != '=') {
-            /* bare key with no value — skip to next whitespace */
-            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
-                p++;
-            if (matched) return xs_strdup("");
+            /* Bare key with no value (treat as empty). */
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+            if (is_match) return xs_strdup("");
             continue;
         }
-        p++; /* '=' */
-        /* read value: bare or quoted */
-        xs_str val;
-        xs_str_init(&val);
+        p++;
+
+        xs_string_buffer value;
+        xs_string_buffer_init(&value);
         if (*p == '"') {
             p++;
             while (*p && *p != '"') {
                 if (*p == '\\' && p[1]) {
-                    char nx = p[1];
-                    if (nx == 'n') xs_str_putc(&val, '\n');
-                    else if (nx == 't') xs_str_putc(&val, '\t');
-                    else if (nx == '"') xs_str_putc(&val, '"');
-                    else if (nx == '\\') xs_str_putc(&val, '\\');
-                    else { xs_str_putc(&val, nx); }
+                    char next = p[1];
+                    if      (next == 'n')  xs_string_buffer_append_char(&value, '\n');
+                    else if (next == 't')  xs_string_buffer_append_char(&value, '\t');
+                    else if (next == '"')  xs_string_buffer_append_char(&value, '"');
+                    else if (next == '\\') xs_string_buffer_append_char(&value, '\\');
+                    else                   xs_string_buffer_append_char(&value, next);
                     p += 2;
                 } else {
-                    xs_str_putc(&val, *p);
-                    p++;
+                    xs_string_buffer_append_char(&value, *p++);
                 }
             }
             if (*p == '"') p++;
         } else {
-            /* bare value: until whitespace */
             while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
                 if (*p == '\\' && p[1]) {
-                    xs_str_putc(&val, p[1]);
+                    xs_string_buffer_append_char(&value, p[1]);
                     p += 2;
                 } else {
-                    xs_str_putc(&val, *p);
-                    p++;
+                    xs_string_buffer_append_char(&value, *p++);
                 }
             }
         }
-        if (matched) {
-            char *r = val.buf ? val.buf : xs_strdup("");
-            /* don't xs_str_free; we're handing buf out (if buf alloc'd) */
-            if (!val.buf) r = xs_strdup("");
-            return r;
+
+        if (is_match) {
+            char *result = value.buffer ? value.buffer : xs_strdup("");
+            return result;
         }
-        xs_str_free(&val);
+        xs_string_buffer_free(&value);
     }
     return NULL;
 }
 
-char *xs_props_merge(const char *defaults, const char *overrides)
-{
-    xs_str s;
-    xs_str_init(&s);
-    if (overrides && *overrides) {
-        xs_str_puts(&s, overrides);
-    }
-    if (defaults && *defaults) {
-        /* For each key in defaults, append only if missing in overrides */
-        const char *p = defaults;
-        while (*p) {
-            while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
-            if (!*p) break;
-            const char *kstart = p;
-            while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
-            size_t klen = (size_t)(p - kstart);
-            if (klen == 0) {
-                /* skip to whitespace */
-                while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
-                continue;
-            }
-            char *kbuf = xs_strndup(kstart, klen);
-            char *existing = xs_prop_get(overrides, kbuf);
-            /* now scan past the value to know where this defaults entry ends */
-            const char *vstart = p;
-            if (*p == '=') {
-                p++;
-                if (*p == '"') {
-                    p++;
-                    while (*p && *p != '"') {
-                        if (*p == '\\' && p[1]) p += 2;
-                        else p++;
-                    }
-                    if (*p == '"') p++;
-                } else {
-                    while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
-                        if (*p == '\\' && p[1]) p += 2;
-                        else p++;
-                    }
-                }
-            }
-            if (!existing) {
-                /* append "<key>=<rest>" */
-                if (s.len > 0) xs_str_putc(&s, '\n');
-                xs_str_putn(&s, kstart, (size_t)(p - kstart));
-                /* if key alone with no value, fine */
-                if (vstart == p) {
-                    /* no value — nothing more to add */
-                }
-            }
-            free(existing);
-            free(kbuf);
-        }
-    }
-    return s.buf ? s.buf : xs_strdup("");
-}
-
 /* ---------------- coordinate transform ---------------- */
-
-void xs_apply_xform(int rot, int flip, double sx, double sy,
-                    double *gx, double *gy);
-void xs_apply_xform(int rot, int flip, double sx, double sy,
-                    double *gx, double *gy)
+/*
+ * XSCHEM 3.4.7 `ROTATION` macro from xschem.h:
+ *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/xschem.h#L339-L346
+ *
+ *     xxtmp = flip ? 2*x0 - x : x;
+ *     rot==0: rx = xxtmp;          ry = y;
+ *     rot==1: rx = x0 - y + y0;    ry = y0 + xxtmp - x0;
+ *     rot==2: rx = 2*x0 - xxtmp;   ry = 2*y0 - y;
+ *     rot==3: rx = x0 + y - y0;    ry = y0 - xxtmp + x0;
+ *
+ * Specialised here to (x0, y0) = (0, 0); callers add the instance origin.
+ *
+ * Note: there is a *different* rotation macro spelled the same way inside
+ * xschem/src/netlist.c — that one is buggy when `flip` is set (uses the
+ * pre-flip x for the rotated y component). xschem.h's macro is the version
+ * called by `get_inst_pin_coord` and is the authoritative one to mirror.
+ */
+void xs_transform_pin_to_global(int rotation, int flip,
+                                double x_in, double y_in,
+                                double *x_out, double *y_out)
 {
-    /* Mirror upstream xschem ROTATION macro from xschem.h, with x0=y0=0:
-     *
-     *   xxtmp = flip ? -sx : sx
-     *   rot==0: rx = xxtmp,  ry = sy
-     *   rot==1: rx = -sy,    ry = xxtmp
-     *   rot==2: rx = -xxtmp, ry = -sy
-     *   rot==3: rx = sy,     ry = -xxtmp
-     *
-     * (There is a different `ROTATION` macro elsewhere in netlist.c that
-     * uses pre-flip `xx` for the y-component — DON'T use it; xschem.h's is
-     * the authoritative one used by `get_inst_pin_coord`.) */
-    double xxtmp = flip ? -sx : sx;
-    double rx = 0, ry = 0;
-    if (rot == 0)      { rx = xxtmp;  ry = sy; }
-    else if (rot == 1) { rx = -sy;    ry = xxtmp; }
-    else if (rot == 2) { rx = -xxtmp; ry = -sy; }
-    else /* rot==3 */  { rx = sy;     ry = -xxtmp; }
-    *gx = rx;
-    *gy = ry;
+    double x_after_flip = flip ? -x_in : x_in;
+    switch (rotation) {
+        case 0:  *x_out =  x_after_flip; *y_out =  y_in;        break;
+        case 1:  *x_out = -y_in;         *y_out =  x_after_flip; break;
+        case 2:  *x_out = -x_after_flip; *y_out = -y_in;        break;
+        default: *x_out =  y_in;         *y_out = -x_after_flip; break;
+    }
 }
 
-/* ---------------- record skippers ---------------- */
+/* ---------------- generic record skippers ---------------- */
 
-/* T {text} x y rot flip xs ys {props} */
-static int skip_record_T(tok_t *t)
+static int skip_text_record_body(parse_cursor *p)
 {
-    if (tok_skip_brace(t) != 0) return -1;
+    /* T {text} x y rot flip xs ys {props} */
+    if (skip_brace_block(p) != 0) return -1;
     double v;
-    for (int i = 0; i < 6; i++) if (tok_number(t, &v) != 0) return -1;
-    return tok_skip_brace(t);
+    for (int i = 0; i < 6; i++) if (read_required_double_token(p, &v) != 0) return -1;
+    return skip_brace_block(p);
+}
+static int skip_line_or_box_record_body(parse_cursor *p)
+{
+    /* L color x1 y1 x2 y2 {props}; B color x1 y1 x2 y2 {props} */
+    double v;
+    for (int i = 0; i < 5; i++) if (read_required_double_token(p, &v) != 0) return -1;
+    return skip_brace_block(p);
+}
+static int skip_arc_record_body(parse_cursor *p)
+{
+    /* A color x y r a b {props} */
+    double v;
+    for (int i = 0; i < 6; i++) if (read_required_double_token(p, &v) != 0) return -1;
+    return skip_brace_block(p);
+}
+static int skip_polygon_record_body(parse_cursor *p)
+{
+    /* P color N x1 y1 ... xN yN {props} */
+    int color, point_count;
+    if (read_required_integer_token(p, &color) != 0)       return -1;
+    if (read_required_integer_token(p, &point_count) != 0) return -1;
+    double v;
+    for (int i = 0; i < 2 * point_count; i++)
+        if (read_required_double_token(p, &v) != 0) return -1;
+    return skip_brace_block(p);
 }
 
-/* L color x1 y1 x2 y2 {props}; B color x1 y1 x2 y2 {props} */
-static int skip_record_LB(tok_t *t)
+static char *basename_without_extension(const char *path, const char *extension)
 {
-    double v;
-    for (int i = 0; i < 5; i++) if (tok_number(t, &v) != 0) return -1;
-    return tok_skip_brace(t);
-}
-
-/* A color x y r a b {props} */
-static int skip_record_A(tok_t *t)
-{
-    double v;
-    for (int i = 0; i < 6; i++) if (tok_number(t, &v) != 0) return -1;
-    return tok_skip_brace(t);
-}
-
-/* P color N x1 y1 ... xN yN {props} */
-static int skip_record_P(tok_t *t)
-{
-    double v;
-    int color, n;
-    if (tok_int(t, &color) != 0) return -1;
-    if (tok_int(t, &n) != 0) return -1;
-    for (int i = 0; i < 2 * n; i++) if (tok_number(t, &v) != 0) return -1;
-    return tok_skip_brace(t);
+    const char *slash = strrchr(path, '/');
+    const char *base  = slash ? slash + 1 : path;
+    size_t len = strlen(base);
+    size_t ext = extension ? strlen(extension) : 0;
+    if (ext && len > ext && strcmp(base + len - ext, extension) == 0) len -= ext;
+    return xs_strndup(base, len);
 }
 
 /* ---------------- schematic parsing ---------------- */
 
-static void push_wire(xs_schematic *sch, xs_wire w)
+static void schematic_append_wire(xs_schematic *s, xs_wire wire)
 {
-    sch->wires = xs_xrealloc(sch->wires,
-                             sizeof(xs_wire) * (size_t)(sch->nwires + 1));
-    sch->wires[sch->nwires++] = w;
-}
-static void push_inst(xs_schematic *sch, xs_instance i)
-{
-    sch->instances = xs_xrealloc(sch->instances,
-                                 sizeof(xs_instance) * (size_t)(sch->ninstances + 1));
-    sch->instances[sch->ninstances++] = i;
+    s->wires = xs_xrealloc(s->wires, sizeof(xs_wire) * (size_t)(s->wire_count + 1));
+    s->wires[s->wire_count++] = wire;
 }
 
-static int parse_schematic_buf(const char *buf, size_t len,
-                               const char *path,
-                               xs_schematic *sch)
+static void schematic_append_instance(xs_schematic *s, xs_instance instance)
 {
-    tok_t t;
-    tok_init(&t, buf, len, path);
+    s->instances = xs_xrealloc(s->instances,
+                               sizeof(xs_instance) * (size_t)(s->instance_count + 1));
+    s->instances[s->instance_count++] = instance;
+}
 
-    while (!tok_eof(&t)) {
-        int ch = tok_peek_record_start(&t);
-        if (ch < 0) break;
-        char tag = (char)ch;
-        t.p++;                /* consume tag char */
+static int parse_schematic_buffer(const char *buf, size_t length,
+                                  const char *path, xs_schematic *out)
+{
+    parse_cursor p;
+    cursor_init(&p, buf, length, path);
+
+    while (!cursor_eof(&p)) {
+        int tag_int = peek_record_tag(&p);
+        if (tag_int < 0) break;
+        char tag = (char)tag_int;
+        p.cursor++;
 
         switch (tag) {
         case 'v': case 'G': case 'K': case 'V': case 'S': case 'E': case 'F':
-            if (tok_skip_brace(&t) != 0) {
+            if (skip_brace_block(&p) != 0) {
                 fprintf(stderr, "%s:%d: expected {} after '%c'\n",
-                        path, t.line, tag);
+                        path, p.line_number, tag);
                 return -1;
             }
             break;
+
         case 'N': {
-            double x1, y1, x2, y2;
-            if (tok_number(&t, &x1) != 0 || tok_number(&t, &y1) != 0 ||
-                tok_number(&t, &x2) != 0 || tok_number(&t, &y2) != 0) {
-                fprintf(stderr, "%s:%d: bad N record\n", path, t.line);
+            xs_wire w = {0};
+            if (read_required_double_token(&p, &w.x1) != 0 ||
+                read_required_double_token(&p, &w.y1) != 0 ||
+                read_required_double_token(&p, &w.x2) != 0 ||
+                read_required_double_token(&p, &w.y2) != 0) {
+                fprintf(stderr, "%s:%d: bad N record\n", path, p.line_number);
                 return -1;
             }
-            char *prop = tok_brace(&t);
-            xs_wire w = {x1, y1, x2, y2, prop};
-            push_wire(sch, w);
+            w.prop_block = read_brace_block(&p);
+            schematic_append_wire(out, w);
             break;
         }
+
         case 'C': {
-            char *symref = tok_brace(&t);
+            char *symref = read_brace_block(&p);
             if (!symref) {
-                fprintf(stderr, "%s:%d: bad C record (no symref)\n",
-                        path, t.line);
+                fprintf(stderr, "%s:%d: bad C record (missing symref)\n",
+                        path, p.line_number);
                 return -1;
             }
-            double x, y;
-            int rot = 0, flip = 0;
-            if (tok_number(&t, &x) != 0 || tok_number(&t, &y) != 0 ||
-                tok_int(&t, &rot) != 0 || tok_int(&t, &flip) != 0) {
+            xs_instance ins = {0};
+            ins.symref = symref;
+            if (read_required_double_token(&p, &ins.x) != 0 ||
+                read_required_double_token(&p, &ins.y) != 0 ||
+                read_required_integer_token(&p, &ins.rotation) != 0 ||
+                read_required_integer_token(&p, &ins.flip) != 0) {
                 fprintf(stderr, "%s:%d: bad C record (numbers)\n",
-                        path, t.line);
+                        path, p.line_number);
                 free(symref);
                 return -1;
             }
-            char *prop = tok_brace(&t);
-            xs_instance ins = {0};
-            ins.symref = symref;
-            ins.x = x; ins.y = y;
-            ins.rot = rot; ins.flip = flip;
-            ins.prop = prop;
-            push_inst(sch, ins);
+            ins.prop_block = read_brace_block(&p);
+            schematic_append_instance(out, ins);
             break;
         }
+
         case 'T':
-            if (skip_record_T(&t) != 0) return -1;
+            if (skip_text_record_body(&p) != 0) return -1;
             break;
-        case 'L': case 'B':
-            if (skip_record_LB(&t) != 0) return -1;
+        case 'L':
+        case 'B':
+            if (skip_line_or_box_record_body(&p) != 0) return -1;
             break;
         case 'A':
-            if (skip_record_A(&t) != 0) return -1;
+            if (skip_arc_record_body(&p) != 0) return -1;
             break;
         case 'P':
-            if (skip_record_P(&t) != 0) return -1;
+            if (skip_polygon_record_body(&p) != 0) return -1;
             break;
         case '#':
-            /* comment to end-of-line — not part of xschem .sch but be lenient */
-            while (!tok_eof(&t) && *t.p != '\n') t.p++;
+            while (!cursor_eof(&p) && *p.cursor != '\n') p.cursor++;
             break;
+
         default:
-            fprintf(stderr, "%s:%d: unknown record '%c'\n", path, t.line, tag);
+            fprintf(stderr, "%s:%d: unknown record '%c'\n",
+                    path, p.line_number, tag);
             return -1;
         }
     }
     return 0;
 }
 
-static char *basename_no_ext(const char *path, const char *ext)
-{
-    const char *slash = strrchr(path, '/');
-    const char *base = slash ? slash + 1 : path;
-    size_t bl = strlen(base);
-    size_t el = ext ? strlen(ext) : 0;
-    if (el && bl > el && strcmp(base + bl - el, ext) == 0) bl -= el;
-    return xs_strndup(base, bl);
-}
-
 int xs_parse_schematic(const char *path, xs_schematic *out)
 {
     memset(out, 0, sizeof *out);
-    size_t len;
-    char *buf = slurp(path, &len);
+    size_t length;
+    char *buf = read_entire_file(path, &length);
     if (!buf) {
         fprintf(stderr, "xschem2spice: cannot open %s\n", path);
         return -1;
     }
-    out->path = xs_strdup(path);
-    out->cell_name = basename_no_ext(path, ".sch");
-    int rc = parse_schematic_buf(buf, len, path, out);
+    out->path      = xs_strdup(path);
+    out->cell_name = basename_without_extension(path, ".sch");
+    int rc = parse_schematic_buffer(buf, length, path, out);
     free(buf);
     return rc;
 }
@@ -453,11 +410,11 @@ int xs_parse_schematic(const char *path, xs_schematic *out)
 void xs_free_schematic(xs_schematic *s)
 {
     if (!s) return;
-    for (int i = 0; i < s->nwires; i++) free(s->wires[i].prop);
+    for (int i = 0; i < s->wire_count;     i++) free(s->wires[i].prop_block);
     free(s->wires);
-    for (int i = 0; i < s->ninstances; i++) {
+    for (int i = 0; i < s->instance_count; i++) {
         free(s->instances[i].symref);
-        free(s->instances[i].prop);
+        free(s->instances[i].prop_block);
     }
     free(s->instances);
     free(s->path);
@@ -467,114 +424,122 @@ void xs_free_schematic(xs_schematic *s)
 
 /* ---------------- symbol parsing ---------------- */
 
-static void push_pin(xs_symbol *sym, xs_pin pin)
+static void symbol_append_pin(xs_symbol *sym, xs_symbol_pin pin)
 {
     sym->pins = xs_xrealloc(sym->pins,
-                            sizeof(xs_pin) * (size_t)(sym->npins + 1));
-    sym->pins[sym->npins++] = pin;
+                            sizeof(xs_symbol_pin) * (size_t)(sym->pin_count + 1));
+    sym->pins[sym->pin_count++] = pin;
 }
 
-static int parse_symbol_buf(const char *buf, size_t len,
-                            const char *path,
-                            xs_symbol *sym)
+/* xschem stashes the canonical metadata in K, but `devices/code.sym` puts it
+ * in G; honour either, with first-wins semantics so K beats G. */
+static void absorb_kg_block_into_symbol(xs_symbol *sym, const char *kprops)
 {
-    tok_t t;
-    tok_init(&t, buf, len, path);
+    #define ABSORB_FIELD(field, key) \
+        do { if (!sym->field) sym->field = xs_prop_get(kprops, key); } while (0)
+    ABSORB_FIELD(type,         "type");
+    ABSORB_FIELD(format,       "format");
+    ABSORB_FIELD(lvs_format,   "lvs_format");
+    ABSORB_FIELD(template_,    "template");
+    ABSORB_FIELD(extra,        "extra");
+    ABSORB_FIELD(spice_ignore, "spice_ignore");
+    #undef ABSORB_FIELD
+}
 
-    while (!tok_eof(&t)) {
-        int ch = tok_peek_record_start(&t);
-        if (ch < 0) break;
-        char tag = (char)ch;
-        t.p++;
+static int parse_symbol_buffer(const char *buf, size_t length,
+                               const char *path, xs_symbol *sym)
+{
+    parse_cursor p;
+    cursor_init(&p, buf, length, path);
+
+    while (!cursor_eof(&p)) {
+        int tag_int = peek_record_tag(&p);
+        if (tag_int < 0) break;
+        char tag = (char)tag_int;
+        p.cursor++;
 
         switch (tag) {
         case 'v': case 'V': case 'S': case 'E': case 'F':
-            if (tok_skip_brace(&t) != 0) {
+            if (skip_brace_block(&p) != 0) {
                 fprintf(stderr, "%s:%d: expected {} after '%c'\n",
-                        path, t.line, tag);
+                        path, p.line_number, tag);
                 return -1;
             }
             break;
+
         case 'K': case 'G': {
-            /* Both K and G blocks may carry type/format/template metadata
-             * (devices/code.sym uses G; most symbols use K). Honor whichever
-             * is non-empty; later blocks fill in fields not yet set. */
-            char *kprops = tok_brace(&t);
+            char *kprops = read_brace_block(&p);
             if (!kprops) return -1;
-#define ABSORB(field, key) do { \
-                if (!sym->field) sym->field = xs_prop_get(kprops, key); \
-            } while (0)
-            ABSORB(type,         "type");
-            ABSORB(format,       "format");
-            ABSORB(lvs_format,   "lvs_format");
-            ABSORB(template_,    "template");
-            ABSORB(extra,        "extra");
-            ABSORB(spice_ignore, "spice_ignore");
-#undef ABSORB
+            absorb_kg_block_into_symbol(sym, kprops);
             free(kprops);
             break;
         }
+
         case 'B': {
-            int color;
+            int    color;
             double x1, y1, x2, y2;
-            if (tok_int(&t, &color) != 0 ||
-                tok_number(&t, &x1) != 0 || tok_number(&t, &y1) != 0 ||
-                tok_number(&t, &x2) != 0 || tok_number(&t, &y2) != 0) {
-                fprintf(stderr, "%s:%d: bad B record\n", path, t.line);
+            if (read_required_integer_token(&p, &color) != 0 ||
+                read_required_double_token(&p, &x1) != 0 ||
+                read_required_double_token(&p, &y1) != 0 ||
+                read_required_double_token(&p, &x2) != 0 ||
+                read_required_double_token(&p, &y2) != 0) {
+                fprintf(stderr, "%s:%d: bad B record\n", path, p.line_number);
                 return -1;
             }
-            char *prop = tok_brace(&t);
-            /* In symbols, color==5 marks a pin box (typically). To be safe,
-             * include any B with a name= property as a pin. */
-            char *pname = xs_prop_get(prop, "name");
-            char *pdir = xs_prop_get(prop, "dir");
-            if (pname) {
-                xs_pin p;
-                p.name = pname;          /* takes ownership */
-                p.dir  = pdir ? pdir : xs_strdup("inout");
-                p.x = (x1 + x2) / 2.0;
-                p.y = (y1 + y2) / 2.0;
-                push_pin(sym, p);
+            char *props    = read_brace_block(&p);
+            char *pin_name = xs_prop_get(props, "name");
+            char *pin_dir  = xs_prop_get(props, "dir");
+            if (pin_name) {
+                xs_symbol_pin pin;
+                pin.name = pin_name;
+                pin.dir  = pin_dir ? pin_dir : xs_strdup("inout");
+                pin.x    = (x1 + x2) / 2.0;
+                pin.y    = (y1 + y2) / 2.0;
+                symbol_append_pin(sym, pin);
             } else {
-                free(pname);
-                free(pdir);
+                free(pin_name);
+                free(pin_dir);
             }
-            free(prop);
+            free(props);
             break;
         }
+
         case 'L':
-            if (skip_record_LB(&t) != 0) return -1;
+            if (skip_line_or_box_record_body(&p) != 0) return -1;
             break;
         case 'T':
-            if (skip_record_T(&t) != 0) return -1;
+            if (skip_text_record_body(&p) != 0) return -1;
             break;
         case 'A':
-            if (skip_record_A(&t) != 0) return -1;
+            if (skip_arc_record_body(&p) != 0) return -1;
             break;
         case 'P':
-            if (skip_record_P(&t) != 0) return -1;
+            if (skip_polygon_record_body(&p) != 0) return -1;
             break;
         case 'N': {
-            /* symbols can technically have wires too — skip them */
             double v;
-            for (int i = 0; i < 4; i++) if (tok_number(&t, &v) != 0) return -1;
-            if (tok_skip_brace(&t) != 0) return -1;
+            for (int i = 0; i < 4; i++)
+                if (read_required_double_token(&p, &v) != 0) return -1;
+            if (skip_brace_block(&p) != 0) return -1;
             break;
         }
         case 'C': {
-            /* nested instance refs in a symbol — skip for now */
-            if (tok_skip_brace(&t) != 0) return -1;
+            if (skip_brace_block(&p) != 0) return -1;
             double v; int iv;
-            if (tok_number(&t, &v) != 0 || tok_number(&t, &v) != 0 ||
-                tok_int(&t, &iv) != 0 || tok_int(&t, &iv) != 0) return -1;
-            if (tok_skip_brace(&t) != 0) return -1;
+            if (read_required_double_token(&p, &v) != 0 ||
+                read_required_double_token(&p, &v) != 0 ||
+                read_required_integer_token(&p, &iv) != 0 ||
+                read_required_integer_token(&p, &iv) != 0) return -1;
+            if (skip_brace_block(&p) != 0) return -1;
             break;
         }
         case '#':
-            while (!tok_eof(&t) && *t.p != '\n') t.p++;
+            while (!cursor_eof(&p) && *p.cursor != '\n') p.cursor++;
             break;
+
         default:
-            fprintf(stderr, "%s:%d: unknown symbol record '%c'\n", path, t.line, tag);
+            fprintf(stderr, "%s:%d: unknown symbol record '%c'\n",
+                    path, p.line_number, tag);
             return -1;
         }
     }
@@ -584,15 +549,15 @@ static int parse_symbol_buf(const char *buf, size_t len,
 int xs_parse_symbol(const char *path, xs_symbol *out)
 {
     memset(out, 0, sizeof *out);
-    size_t len;
-    char *buf = slurp(path, &len);
+    size_t length;
+    char *buf = read_entire_file(path, &length);
     if (!buf) {
         fprintf(stderr, "xschem2spice: cannot open symbol %s\n", path);
         return -1;
     }
     out->path = xs_strdup(path);
-    out->name = basename_no_ext(path, ".sym");
-    int rc = parse_symbol_buf(buf, len, path, out);
+    out->name = basename_without_extension(path, ".sym");
+    int rc = parse_symbol_buffer(buf, length, path, out);
     free(buf);
     return rc;
 }
@@ -600,7 +565,7 @@ int xs_parse_symbol(const char *path, xs_symbol *out)
 void xs_free_symbol(xs_symbol *s)
 {
     if (!s) return;
-    for (int i = 0; i < s->npins; i++) {
+    for (int i = 0; i < s->pin_count; i++) {
         free(s->pins[i].name);
         free(s->pins[i].dir);
     }
