@@ -19,6 +19,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Create build dirs
         run: |
@@ -69,10 +71,6 @@ jobs:
           python3 -m venv ciel-venv
           ciel-venv/bin/python3 -m pip install --upgrade --no-cache-dir pip ciel
           ciel-venv/bin/ciel enable --pdk-family sky130 0fe599b2afb6708d281543108caf8310912f54af
-
-      - name: Initialize schematic submodules
-        run: |
-          git submodule update --init --recursive --depth 1
 
       - name: Build
         run: |
