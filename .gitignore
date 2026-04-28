@@ -1,0 +1,11 @@
+
+*.o
+*.a
+xschem2spice
+
+test/reports/
+test/work/
+*.spice
+*.report
+*.failed
+*.log

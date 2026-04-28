@@ -1,0 +1,6 @@
+[submodule "test/schematics/xschem"]
+	path = test/schematics/xschem
+	url = https://github.com/StefanSchippers/xschem.git
+[submodule "test/schematics/sky130_schematics"]
+	path = test/schematics/sky130_schematics
+	url = https://github.com/sifferman/sky130_schematics.git

@@ -1,0 +1,83 @@
+name: Test on Push
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      tools: ${{ github.workspace }}/tools
+      git: ${{ github.workspace }}/git
+      PDK_ROOT: ${{ github.workspace }}/tools/ciel-pdks
+      PDK: sky130A
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create build dirs
+        run: |
+          mkdir -p "${{ env.tools }}"
+          mkdir -p "${{ env.git }}"
+
+      - name: Install apt packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            build-essential \
+            flex \
+            libcairo2-dev \
+            libreadline-dev \
+            libtool-bin \
+            libx11-dev \
+            libxaw7-dev \
+            libxpm-dev \
+            python3 \
+            python3-venv \
+            tcl-dev \
+            tk-dev
+
+      - name: Install xschem
+        run: |
+          cd "${{ env.git }}"
+          git clone --branch 3.4.7 --depth 1 https://github.com/StefanSchippers/xschem.git
+          cd xschem
+          ./configure --prefix="${{ env.tools }}/xschem"
+          make -j"$(nproc)"
+          make install
+          echo "${{ env.tools }}/xschem/bin" >> "$GITHUB_PATH"
+
+      - name: Install netgen
+        run: |
+          cd "${{ env.git }}"
+          git clone --depth 1 https://github.com/RTimothyEdwards/netgen.git
+          cd netgen
+          ./configure --prefix="${{ env.tools }}/netgen"
+          make -j"$(nproc)"
+          make install
+          echo "${{ env.tools }}/netgen/bin" >> "$GITHUB_PATH"
+
+      - name: Generate PDK files
+        run: |
+          cd "${{ env.tools }}"
+          python3 -m venv ciel-venv
+          ciel-venv/bin/python3 -m pip install --upgrade --no-cache-dir pip ciel
+          ciel-venv/bin/ciel enable --pdk-family sky130 0fe599b2afb6708d281543108caf8310912f54af
+
+      - name: Initialize schematic submodules
+        run: |
+          git submodule update --init --recursive --depth 1
+
+      - name: Build
+        run: |
+          make
+
+      - name: LVS
+        run: |
+          make test XSCHEM_EXAMPLES=1
