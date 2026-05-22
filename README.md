@@ -91,6 +91,22 @@ xschem2spice \
     test/schematics/sky130_schematics/schematics/dfxtp/sky130_fd_sc_hd__dfxtp_1.sch
 ```
 
+## WebAssembly
+
+The library is portable C with no threads, sockets, or process spawning, so
+it compiles to `wasm32-wasi` and runs under any WASI host (wasmtime, Node,
+browsers via a shim). The only runtime requirement is a preopened directory
+for the schematic and symbol files.
+
+```bash
+make wasm  WASI_SDK=/path/to/wasi-sdk     # build xschem2spice.wasm
+make wasm-test WASI_SDK=/path/to/wasi-sdk # hermetic smoke test (needs wasmtime)
+```
+
+`wasm-test` runs the module on a self-contained two-resistor schematic under
+`test/wasm/` and diffs the output against a committed golden netlist — no
+xschem, netgen, or PDK required. It runs in CI on every push.
+
 ## Verification
 
 The `test/` harness runs both the real `xschem` binary and `xschem2spice`

@@ -87,3 +87,29 @@ jobs:
           name: lvs-reports
           path: test/reports
           if-no-files-found: ignore
+
+  # WebAssembly build + smoke test
+  wasm:
+    runs-on: ubuntu-latest
+    env:
+      WASI_SDK_VERSION: "24"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install wasi-sdk
+        run: |
+          url="https://github.com/WebAssembly/wasi-sdk/releases/download"
+          url="$url/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
+          curl -sSfL "$url" | sudo tar xz -C /opt
+          sudo mv "/opt/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux" /opt/wasi-sdk
+
+      - name: Install wasmtime
+        run: |
+          curl -sSf https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: Build WASM module
+        run: make wasm WASI_SDK=/opt/wasi-sdk
+
+      - name: WASM smoke test
+        run: make wasm-test WASI_SDK=/opt/wasi-sdk
