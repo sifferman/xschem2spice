@@ -1,6 +1,7 @@
 
 *.o
 *.a
+*.wasm
 xschem2spice
 
 test/reports/
@@ -9,3 +10,6 @@ test/work/
 *.report
 *.failed
 *.log
+
+# Keep golden netlists
+!*.golden.spice

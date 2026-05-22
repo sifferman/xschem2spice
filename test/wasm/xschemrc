@@ -1,0 +1,4 @@
+# Hermetic xschemrc for the WASM smoke test: resolve symbols from this
+# directory only, so the test needs no PDK or external library.
+set XSCHEM_LIBRARY_PATH {}
+append XSCHEM_LIBRARY_PATH :[file dirname [info script]]

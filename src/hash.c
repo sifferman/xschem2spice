@@ -22,15 +22,16 @@
 #include "hash.h"
 #include "strutil.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-static unsigned long fnv1a_hash(const char *s)
+static uint64_t fnv1a_hash(const char *s)
 {
-    unsigned long h = 1469598103934665603UL;
+    uint64_t h = 1469598103934665603ULL;
     while (*s) {
         h ^= (unsigned char)*s++;
-        h *= 1099511628211UL;
+        h *= 1099511628211ULL;
     }
     return h;
 }

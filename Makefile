@@ -16,7 +16,13 @@ CLI_OBJS = $(CLI_SRCS:.c=.o)
 BIN = xschem2spice
 LIB = libxschem2spice.a
 
-.PHONY: all clean test
+# WebAssembly (WASI) build. Set WASI_SDK to your wasi-sdk install root.
+WASI_SDK ?= /opt/wasi-sdk
+WASI_CC   = $(WASI_SDK)/bin/clang --target=wasm32-wasi --sysroot=$(WASI_SDK)/share/wasi-sysroot
+WASM      = xschem2spice.wasm
+WASM_RUNNER ?= wasmtime run --dir=.
+
+.PHONY: all clean test wasm wasm-test
 
 all: $(BIN) $(LIB)
 
@@ -32,6 +38,17 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 test: $(BIN)
 	$(MAKE) -C test
 
+wasm: $(WASM)
+
+$(WASM): $(CLI_SRCS) $(LIB_SRCS)
+	$(WASI_CC) $(CFLAGS) -o $@ $^
+
+wasm-test: $(WASM)
+	$(WASM_RUNNER) $(WASM) --xschemrc test/wasm/xschemrc test/wasm/divider.sch \
+	    | grep -v '^\*\* sch_path:' > test/wasm/divider.out.spice
+	diff -u test/wasm/divider.golden.spice test/wasm/divider.out.spice
+	@echo "WASM smoke test passed."
+
 clean:
-	rm -f $(LIB_OBJS) $(CLI_OBJS) $(BIN) $(LIB)
+	rm -f $(LIB_OBJS) $(CLI_OBJS) $(BIN) $(LIB) $(WASM) test/wasm/divider.out.spice
 	$(MAKE) -C test clean

@@ -1,0 +1,9 @@
+v {xschem version=3.4.7 file_version=1.2}
+K {type=resistor
+format="@name @pinlist @value"
+template="name=R1 value=1k"}
+V {}
+S {}
+E {}
+B 5 -2.5 -22.5 2.5 -17.5 {name=p dir=inout}
+B 5 -2.5 17.5 2.5 22.5 {name=m dir=inout}
