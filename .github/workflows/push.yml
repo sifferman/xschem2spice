@@ -95,6 +95,8 @@ jobs:
       WASI_SDK_VERSION: "24"
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install wasi-sdk
         run: |
