@@ -48,7 +48,6 @@ wasm-smoke: $(WASM_SMOKE_BINARY)
 	diff -u $(WASM_SMOKE_GOLDEN) $(WASM_SMOKE_OUTPUT)
 	@echo "WASM smoke test passed."
 
-# Build the binaries if not already there.
 $(ROOT)/xschem2spice:
 	$(MAKE) -C $(ROOT)
 

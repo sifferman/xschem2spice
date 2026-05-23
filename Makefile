@@ -43,9 +43,6 @@ wasm: $(WASM)
 $(WASM): $(CLI_SRCS) $(LIB_SRCS)
 	$(WASI_CC) $(CFLAGS) -o $@ $^
 
-# The smoke test config + recipe live in test/Makefile alongside the
-# other test data. The dependency on $(WASM) here ensures the binary is
-# built before delegating.
 wasm-smoke: $(WASM)
 	$(MAKE) -C test wasm-smoke
 
