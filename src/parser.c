@@ -611,6 +611,7 @@ static int parse_symbol_buffer(const char *buf, size_t length,
                 pin.x    = (record.data.box.x1 + record.data.box.x2) / 2.0;
                 pin.y    = (record.data.box.y1 + record.data.box.y2) / 2.0;
                 symbol_append_pin(sym, pin);
+                record.data.box.filled = 1;
             } else {
                 free(pin_name);
                 free(pin_dir);
