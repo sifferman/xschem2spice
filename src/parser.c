@@ -245,40 +245,84 @@ void xs_transform_pin_to_global(int rotation, int flip,
     }
 }
 
-/* ---------------- generic record skippers ---------------- */
+/* ---------------- drawing-primitive record readers ---------------- */
 
-static int skip_text_record_body(parse_cursor *p)
+static int read_line_record(parse_cursor *p, xs_line *out)
 {
-    /* T {text} x y rot flip xs ys {props} */
-    if (skip_brace_block(p) != 0) return -1;
-    double v;
-    for (int i = 0; i < 6; i++) if (read_required_double_token(p, &v) != 0) return -1;
+    /* L color x1 y1 x2 y2 {props} */
+    if (read_required_integer_token(p, &out->color) != 0 ||
+        read_required_double_token(p, &out->x1)     != 0 ||
+        read_required_double_token(p, &out->y1)     != 0 ||
+        read_required_double_token(p, &out->x2)     != 0 ||
+        read_required_double_token(p, &out->y2)     != 0) return -1;
     return skip_brace_block(p);
 }
-static int skip_line_or_box_record_body(parse_cursor *p)
+
+static int read_box_record(parse_cursor *p, xs_box *out, char **out_props)
 {
-    /* L color x1 y1 x2 y2 {props}; B color x1 y1 x2 y2 {props} */
-    double v;
-    for (int i = 0; i < 5; i++) if (read_required_double_token(p, &v) != 0) return -1;
+    /* B color x1 y1 x2 y2 {props} */
+    if (read_required_integer_token(p, &out->color) != 0 ||
+        read_required_double_token(p, &out->x1)     != 0 ||
+        read_required_double_token(p, &out->y1)     != 0 ||
+        read_required_double_token(p, &out->x2)     != 0 ||
+        read_required_double_token(p, &out->y2)     != 0) return -1;
+    *out_props = read_brace_block(p);
+    return *out_props ? 0 : -1;
+}
+
+static int read_arc_record(parse_cursor *p, xs_arc *out)
+{
+    /* A color cx cy radius start_angle sweep_angle {props} */
+    if (read_required_integer_token(p, &out->color)               != 0 ||
+        read_required_double_token (p, &out->center_x)            != 0 ||
+        read_required_double_token (p, &out->center_y)            != 0 ||
+        read_required_double_token (p, &out->radius)              != 0 ||
+        read_required_double_token (p, &out->start_angle_degrees) != 0 ||
+        read_required_double_token (p, &out->sweep_angle_degrees) != 0) return -1;
     return skip_brace_block(p);
 }
-static int skip_arc_record_body(parse_cursor *p)
-{
-    /* A color x y r a b {props} */
-    double v;
-    for (int i = 0; i < 6; i++) if (read_required_double_token(p, &v) != 0) return -1;
-    return skip_brace_block(p);
-}
-static int skip_polygon_record_body(parse_cursor *p)
+
+static int read_polygon_record(parse_cursor *p, xs_polygon *out)
 {
     /* P color N x1 y1 ... xN yN {props} */
-    int color, point_count;
-    if (read_required_integer_token(p, &color) != 0)       return -1;
-    if (read_required_integer_token(p, &point_count) != 0) return -1;
-    double v;
-    for (int i = 0; i < 2 * point_count; i++)
-        if (read_required_double_token(p, &v) != 0) return -1;
+    int color = 0;
+    int vertex_count = 0;
+    if (read_required_integer_token(p, &color)        != 0) return -1;
+    if (read_required_integer_token(p, &vertex_count) != 0) return -1;
+    if (vertex_count < 0) return -1;
+    out->color        = color;
+    out->vertex_count = vertex_count;
+    out->vertex_xs    = vertex_count > 0 ? xs_xmalloc(sizeof(double) * (size_t)vertex_count) : NULL;
+    out->vertex_ys    = vertex_count > 0 ? xs_xmalloc(sizeof(double) * (size_t)vertex_count) : NULL;
+    for (int i = 0; i < vertex_count; i++) {
+        if (read_required_double_token(p, &out->vertex_xs[i]) != 0 ||
+            read_required_double_token(p, &out->vertex_ys[i]) != 0) {
+            free(out->vertex_xs); free(out->vertex_ys);
+            out->vertex_xs = out->vertex_ys = NULL;
+            out->vertex_count = 0;
+            return -1;
+        }
+    }
     return skip_brace_block(p);
+}
+
+static int read_text_record(parse_cursor *p, xs_text_label *out)
+{
+    /* T {text} x y rotation flip horizontal_size vertical_size {props} */
+    char *text = read_brace_block(p);
+    if (!text) return -1;
+    if (read_required_double_token (p, &out->anchor_x)               != 0 ||
+        read_required_double_token (p, &out->anchor_y)               != 0 ||
+        read_required_integer_token(p, &out->rotation_quarter_turns) != 0 ||
+        read_required_integer_token(p, &out->flip)                   != 0 ||
+        read_required_double_token (p, &out->horizontal_size_factor) != 0 ||
+        read_required_double_token (p, &out->vertical_size_factor)   != 0) {
+        free(text);
+        return -1;
+    }
+    out->text       = text;
+    out->prop_block = read_brace_block(p);
+    return out->prop_block ? 0 : -1;
 }
 
 static char *basename_without_extension(const char *path, const char *extension)
@@ -289,6 +333,35 @@ static char *basename_without_extension(const char *path, const char *extension)
     size_t ext = extension ? strlen(extension) : 0;
     if (ext && len > ext && strcmp(base + len - ext, extension) == 0) len -= ext;
     return xs_strndup(base, len);
+}
+
+static void append_drawing_record(xs_drawing_record **records, int *count,
+                                  xs_drawing_record value)
+{
+    *records = xs_xrealloc(*records, sizeof(xs_drawing_record) * (size_t)(*count + 1));
+    (*records)[(*count)++] = value;
+}
+
+static int read_drawing_record_for_tag(parse_cursor *p, char tag,
+                                       xs_drawing_record *out)
+{
+    out->tag = tag;
+    switch (tag) {
+    case 'L': return read_line_record(p, &out->data.line);
+    case 'P': {
+        out->data.polygon.vertex_count = 0;
+        out->data.polygon.vertex_xs    = NULL;
+        out->data.polygon.vertex_ys    = NULL;
+        return read_polygon_record(p, &out->data.polygon);
+    }
+    case 'A': return read_arc_record(p, &out->data.arc);
+    case 'T': {
+        out->data.text.text       = NULL;
+        out->data.text.prop_block = NULL;
+        return read_text_record(p, &out->data.text);
+    }
+    default: return -1;
+    }
 }
 
 /* ---------------- schematic parsing ---------------- */
@@ -364,19 +437,27 @@ static int parse_schematic_buffer(const char *buf, size_t length,
             break;
         }
 
-        case 'T':
-            if (skip_text_record_body(&p) != 0) return -1;
+        case 'L': case 'P': case 'A': case 'T': {
+            xs_drawing_record record = {0};
+            if (read_drawing_record_for_tag(&p, tag, &record) != 0) {
+                fprintf(stderr, "%s:%d: bad %c record\n", path, p.line_number, tag);
+                return -1;
+            }
+            append_drawing_record(&out->drawing_records, &out->drawing_record_count, record);
             break;
-        case 'L':
-        case 'B':
-            if (skip_line_or_box_record_body(&p) != 0) return -1;
+        }
+        case 'B': {
+            xs_drawing_record record = {0};
+            record.tag = 'B';
+            char *props = NULL;
+            if (read_box_record(&p, &record.data.box, &props) != 0) {
+                fprintf(stderr, "%s:%d: bad B record\n", path, p.line_number);
+                return -1;
+            }
+            free(props);
+            append_drawing_record(&out->drawing_records, &out->drawing_record_count, record);
             break;
-        case 'A':
-            if (skip_arc_record_body(&p) != 0) return -1;
-            break;
-        case 'P':
-            if (skip_polygon_record_body(&p) != 0) return -1;
-            break;
+        }
         case '#':
             while (!cursor_eof(&p) && *p.cursor != '\n') p.cursor++;
             break;
@@ -406,6 +487,28 @@ int xs_parse_schematic(const char *path, xs_schematic *out)
     return rc;
 }
 
+static void free_drawing_record_owned_data(xs_drawing_record *record)
+{
+    switch (record->tag) {
+    case 'P':
+        free(record->data.polygon.vertex_xs);
+        free(record->data.polygon.vertex_ys);
+        break;
+    case 'T':
+        free(record->data.text.text);
+        free(record->data.text.prop_block);
+        break;
+    default:
+        break;
+    }
+}
+
+static void free_drawing_record_array(xs_drawing_record *records, int record_count)
+{
+    for (int i = 0; i < record_count; i++) free_drawing_record_owned_data(&records[i]);
+    free(records);
+}
+
 void xs_free_schematic(xs_schematic *s)
 {
     if (!s) return;
@@ -418,6 +521,7 @@ void xs_free_schematic(xs_schematic *s)
     free(s->instances);
     free(s->path);
     free(s->cell_name);
+    free_drawing_record_array(s->drawing_records, s->drawing_record_count);
     memset(s, 0, sizeof *s);
 }
 
@@ -475,46 +579,40 @@ static int parse_symbol_buffer(const char *buf, size_t length,
         }
 
         case 'B': {
-            int    color;
-            double x1, y1, x2, y2;
-            if (read_required_integer_token(&p, &color) != 0 ||
-                read_required_double_token(&p, &x1) != 0 ||
-                read_required_double_token(&p, &y1) != 0 ||
-                read_required_double_token(&p, &x2) != 0 ||
-                read_required_double_token(&p, &y2) != 0) {
+            xs_drawing_record record = {0};
+            record.tag = 'B';
+            char *props = NULL;
+            if (read_box_record(&p, &record.data.box, &props) != 0) {
                 fprintf(stderr, "%s:%d: bad B record\n", path, p.line_number);
                 return -1;
             }
-            char *props    = read_brace_block(&p);
             char *pin_name = xs_prop_get(props, "name");
             char *pin_dir  = xs_prop_get(props, "dir");
             if (pin_name) {
                 xs_symbol_pin pin;
                 pin.name = pin_name;
                 pin.dir  = pin_dir ? pin_dir : xs_strdup("inout");
-                pin.x    = (x1 + x2) / 2.0;
-                pin.y    = (y1 + y2) / 2.0;
+                pin.x    = (record.data.box.x1 + record.data.box.x2) / 2.0;
+                pin.y    = (record.data.box.y1 + record.data.box.y2) / 2.0;
                 symbol_append_pin(sym, pin);
             } else {
                 free(pin_name);
                 free(pin_dir);
             }
             free(props);
+            append_drawing_record(&sym->drawing_records, &sym->drawing_record_count, record);
             break;
         }
 
-        case 'L':
-            if (skip_line_or_box_record_body(&p) != 0) return -1;
+        case 'L': case 'P': case 'A': case 'T': {
+            xs_drawing_record record = {0};
+            if (read_drawing_record_for_tag(&p, tag, &record) != 0) {
+                fprintf(stderr, "%s:%d: bad %c record\n", path, p.line_number, tag);
+                return -1;
+            }
+            append_drawing_record(&sym->drawing_records, &sym->drawing_record_count, record);
             break;
-        case 'T':
-            if (skip_text_record_body(&p) != 0) return -1;
-            break;
-        case 'A':
-            if (skip_arc_record_body(&p) != 0) return -1;
-            break;
-        case 'P':
-            if (skip_polygon_record_body(&p) != 0) return -1;
-            break;
+        }
         case 'N': {
             double v;
             for (int i = 0; i < 4; i++)
@@ -577,5 +675,6 @@ void xs_free_symbol(xs_symbol *s)
     free(s->template_);
     free(s->extra);
     free(s->spice_ignore);
+    free_drawing_record_array(s->drawing_records, s->drawing_record_count);
     memset(s, 0, sizeof *s);
 }
