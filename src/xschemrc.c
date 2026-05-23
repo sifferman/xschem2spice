@@ -23,7 +23,6 @@
 #include "strutil.h"
 
 #include <ctype.h>
-#include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,11 +34,27 @@ static int file_exists(const char *path)
     return path && stat(path, &st) == 0;
 }
 
+/* Portable equivalent of POSIX dirname() — avoids <libgen.h>, which MSVC
+ * doesn't ship. On Windows we treat '\\' as a separator too. */
 static char *parent_directory(const char *path)
 {
-    char *dup = xs_strdup(path);
-    char *r   = xs_strdup(dirname(dup));
-    free(dup);
+    if (!path || !*path) return xs_strdup(".");
+    char *r = xs_strdup(path);
+    char *last = strrchr(r, '/');
+#ifdef _WIN32
+    char *bs = strrchr(r, '\\');
+    if (bs && (!last || bs > last)) last = bs;
+#endif
+    if (!last) {
+        free(r);
+        return xs_strdup(".");
+    }
+    if (last == r) {
+        /* Single leading separator: root directory, e.g. "/file" -> "/". */
+        last[1] = '\0';
+    } else {
+        *last = '\0';
+    }
     return r;
 }
 
