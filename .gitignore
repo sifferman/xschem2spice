@@ -13,3 +13,6 @@ test/work/
 
 # Keep golden netlists
 !*.golden.spice
+
+# Transient netlist output produced by `make wasm-smoke`
+test/wasm-smoke/*.out.spice

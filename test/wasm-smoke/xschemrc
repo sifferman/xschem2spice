@@ -1,0 +1,5 @@
+# Hermetic xschemrc for the WASM smoke test. Resolves symbols out of the
+# xschem submodule (pinned alongside this repo), so the test needs no PDK,
+# no external library, and no network.
+set XSCHEM_LIBRARY_PATH {}
+append XSCHEM_LIBRARY_PATH :[file dirname [info script]]/../schematics/xschem/xschem_library/devices

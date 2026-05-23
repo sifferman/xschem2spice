@@ -1,0 +1,5 @@
+.subckt diode_1 p m
+*.PININFO p:B m:B
+G2 p m vcr pwl(1) p m 'VTH-0.1' ROFF 'VTH+0.1' RON
+.ends
+.end

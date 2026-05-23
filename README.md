@@ -99,13 +99,15 @@ browsers via a shim). The only runtime requirement is a preopened directory
 for the schematic and symbol files.
 
 ```bash
-make wasm  WASI_SDK=/path/to/wasi-sdk     # build xschem2spice.wasm
-make wasm-test WASI_SDK=/path/to/wasi-sdk # hermetic smoke test (needs wasmtime)
+make wasm       WASI_SDK=/path/to/wasi-sdk # build xschem2spice.wasm
+make wasm-smoke WASI_SDK=/path/to/wasi-sdk # hermetic smoke test (needs wasmtime)
 ```
 
-`wasm-test` runs the module on a self-contained two-resistor schematic under
-`test/wasm/` and diffs the output against a committed golden netlist — no
-xschem, netgen, or PDK required. It runs in CI on every push.
+`wasm-smoke` runs the module on `diode_1.sch` from the `xschem`
+submodule (resolving its symbol references against the submodule's
+own `xschem_library/devices/`), and diffs the output against
+`test/wasm-smoke/diode_1.golden.spice` — no xschem binary, no netgen,
+no PDK required.
 
 ## Verification
 
@@ -113,9 +115,8 @@ The `test/` harness runs both the real `xschem` binary and `xschem2spice`
 over every `.sch` it can find, then compares the two with `netgen` LVS:
 
 ```bash
-make -C test init      # init + sparse-checkout the submodules
-make -C test           # run xschem + xschem2spice + netgen LVS
-make -C test summary   # print "N / M schematics pass LVS"
+make -C test init                        # init the test-schematic submodules
+make -C test PDK_ROOT=/path/to/ciel-pdks # run xschem + xschem2spice + netgen LVS
 ```
 
 Test schematics come from two sparse-checked-out submodules:

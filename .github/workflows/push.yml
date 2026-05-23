@@ -79,7 +79,7 @@ jobs:
 
       - name: Run tests
         run: |
-          make test XSCHEM_EXAMPLES=1
+          make test
 
       - name: Upload LVS reports
         uses: actions/upload-artifact@v4
@@ -112,4 +112,4 @@ jobs:
         run: make wasm WASI_SDK=/opt/wasi-sdk
 
       - name: WASM smoke test
-        run: make wasm-test WASI_SDK=/opt/wasi-sdk
+        run: make wasm-smoke WASI_SDK=/opt/wasi-sdk

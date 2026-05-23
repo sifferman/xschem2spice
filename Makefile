@@ -22,7 +22,7 @@ WASI_CC   = $(WASI_SDK)/bin/clang --target=wasm32-wasi --sysroot=$(WASI_SDK)/sha
 WASM      = xschem2spice.wasm
 WASM_RUNNER ?= wasmtime run --dir=.
 
-.PHONY: all clean test wasm wasm-test
+.PHONY: all clean test wasm wasm-smoke
 
 all: $(BIN) $(LIB)
 
@@ -43,12 +43,12 @@ wasm: $(WASM)
 $(WASM): $(CLI_SRCS) $(LIB_SRCS)
 	$(WASI_CC) $(CFLAGS) -o $@ $^
 
-wasm-test: $(WASM)
-	$(WASM_RUNNER) $(WASM) --xschemrc test/wasm/xschemrc test/wasm/divider.sch \
-	    | grep -v '^\*\* sch_path:' > test/wasm/divider.out.spice
-	diff -u test/wasm/divider.golden.spice test/wasm/divider.out.spice
-	@echo "WASM smoke test passed."
+# The smoke test config + recipe live in test/Makefile alongside the
+# other test data. The dependency on $(WASM) here ensures the binary is
+# built before delegating.
+wasm-smoke: $(WASM)
+	$(MAKE) -C test wasm-smoke
 
 clean:
-	rm -f $(LIB_OBJS) $(CLI_OBJS) $(BIN) $(LIB) $(WASM) test/wasm/divider.out.spice
+	rm -f $(LIB_OBJS) $(CLI_OBJS) $(BIN) $(LIB) $(WASM)
 	$(MAKE) -C test clean
