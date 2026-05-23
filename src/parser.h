@@ -46,11 +46,13 @@ typedef struct {
 
 typedef struct {
     int    color;
+    int    filled;
     double x1, y1, x2, y2;
 } xs_box;
 
 typedef struct {
     int     color;
+    int     filled;
     int     vertex_count;
     double *vertex_xs;
     double *vertex_ys;

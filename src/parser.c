@@ -258,6 +258,16 @@ static int read_line_record(parse_cursor *p, xs_line *out)
     return skip_brace_block(p);
 }
 
+static int property_block_has_fill_true(const char *property_block)
+{
+    if (!property_block) return 0;
+    char *fill_value = xs_prop_get(property_block, "fill");
+    if (!fill_value) return 0;
+    const int is_truthy = (strcmp(fill_value, "true") == 0 || strcmp(fill_value, "1") == 0);
+    free(fill_value);
+    return is_truthy;
+}
+
 static int read_box_record(parse_cursor *p, xs_box *out, char **out_props)
 {
     /* B color x1 y1 x2 y2 {props} */
@@ -267,7 +277,9 @@ static int read_box_record(parse_cursor *p, xs_box *out, char **out_props)
         read_required_double_token(p, &out->x2)     != 0 ||
         read_required_double_token(p, &out->y2)     != 0) return -1;
     *out_props = read_brace_block(p);
-    return *out_props ? 0 : -1;
+    if (!*out_props) return -1;
+    out->filled = property_block_has_fill_true(*out_props);
+    return 0;
 }
 
 static int read_arc_record(parse_cursor *p, xs_arc *out)
@@ -303,7 +315,11 @@ static int read_polygon_record(parse_cursor *p, xs_polygon *out)
             return -1;
         }
     }
-    return skip_brace_block(p);
+    char *property_block = read_brace_block(p);
+    if (!property_block) return -1;
+    out->filled = property_block_has_fill_true(property_block);
+    free(property_block);
+    return 0;
 }
 
 static int read_text_record(parse_cursor *p, xs_text_label *out)
