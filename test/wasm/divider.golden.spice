@@ -1,6 +1,0 @@
-.subckt divider IN MID GND
-*.PININFO IN:I MID:O GND:O
-R1 IN MID 1k
-R2 MID GND 2k
-.ends
-.end

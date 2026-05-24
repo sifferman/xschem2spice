@@ -1,0 +1,4 @@
+# Path is cwd-relative because wasi-libc's path_open rejects any `..`
+# even when the resolved path stays inside the preopened directory.
+set XSCHEM_LIBRARY_PATH {}
+append XSCHEM_LIBRARY_PATH :schematics/xschem/xschem_library/devices

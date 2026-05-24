@@ -40,16 +40,66 @@ typedef struct {
 } xs_symbol_pin;
 
 typedef struct {
-    char         *name;          /* basename without .sym, e.g. "nfet_01v8" */
-    char         *path;          /* file the symbol was loaded from */
-    char         *type;          /* K-block type=:  nmos|pmos|subcircuit|ipin|opin|label|... */
-    char         *format;        /* K-block format= raw string, possibly NULL */
-    char         *lvs_format;    /* K-block lvs_format= raw string, possibly NULL */
-    char         *template_;    /* K-block template= raw string, possibly NULL */
-    char         *extra;         /* K-block extra= (manual subckt port list), possibly NULL */
-    char         *spice_ignore;  /* K-block spice_ignore=, possibly NULL */
-    xs_symbol_pin *pins;
-    int           pin_count;
+    int    color;
+    double x1, y1, x2, y2;
+} xs_line;
+
+typedef struct {
+    int    color;
+    int    filled;
+    double x1, y1, x2, y2;
+} xs_box;
+
+typedef struct {
+    int     color;
+    int     filled;
+    int     vertex_count;
+    double *vertex_xs;
+    double *vertex_ys;
+} xs_polygon;
+
+typedef struct {
+    int    color;
+    double center_x, center_y;
+    double radius;
+    double start_angle_degrees;
+    double sweep_angle_degrees;
+} xs_arc;
+
+typedef struct {
+    int     rotation_quarter_turns;
+    int     flip;
+    double  anchor_x, anchor_y;
+    double  horizontal_size_factor;
+    double  vertical_size_factor;
+    char   *text;
+    char   *prop_block;
+} xs_text_label;
+
+typedef struct {
+    char tag; // L, B, P, A, T
+    union {
+        xs_line       line;
+        xs_box        box;
+        xs_polygon    polygon;
+        xs_arc        arc;
+        xs_text_label text;
+    } data;
+} xs_drawing_record;
+
+typedef struct {
+    char              *name;          /* basename without .sym, e.g. "nfet_01v8" */
+    char              *path;          /* file the symbol was loaded from */
+    char              *type;          /* K-block type=:  nmos|pmos|subcircuit|ipin|opin|label|... */
+    char              *format;        /* K-block format= raw string, possibly NULL */
+    char              *lvs_format;    /* K-block lvs_format= raw string, possibly NULL */
+    char              *template_;     /* K-block template= raw string, possibly NULL */
+    char              *extra;         /* K-block extra= (manual subckt port list), possibly NULL */
+    char              *spice_ignore;  /* K-block spice_ignore=, possibly NULL */
+    xs_symbol_pin     *pins;
+    int                pin_count;
+    xs_drawing_record *drawing_records;
+    int                drawing_record_count;
 } xs_symbol;
 
 typedef struct {
@@ -58,21 +108,23 @@ typedef struct {
 } xs_wire;
 
 typedef struct {
-    char       *symref;           /* exact .sch reference, e.g. "sky130_fd_pr/nfet_01v8.sym" */
-    double      x, y;             /* placement origin in schematic coordinates */
-    int         rotation;         /* xschem rotation, 0..3 (×90° CCW) */
-    int         flip;             /* xschem flip, 0 or 1 */
-    char       *prop_block;       /* raw `{...}` from the C-record */
-    xs_symbol  *resolved_symbol;  /* filled by xs_netlister_resolve_symbols */
+    char      *symref;           /* exact .sch reference, e.g. "sky130_fd_pr/nfet_01v8.sym" */
+    double     x, y;             /* placement origin in schematic coordinates */
+    int        rotation;         /* xschem rotation, 0..3 (×90° CCW) */
+    int        flip;             /* xschem flip, 0 or 1 */
+    char      *prop_block;       /* raw `{...}` from the C-record */
+    xs_symbol *resolved_symbol;  /* filled by xs_netlister_resolve_symbols */
 } xs_instance;
 
 typedef struct {
-    xs_wire      *wires;
-    int           wire_count;
-    xs_instance  *instances;
-    int           instance_count;
-    char         *path;           /* path the schematic was loaded from */
-    char         *cell_name;      /* basename without .sch */
+    xs_wire           *wires;
+    int                wire_count;
+    xs_instance       *instances;
+    int                instance_count;
+    char              *path;          /* path the schematic was loaded from */
+    char              *cell_name;     /* basename without .sch */
+    xs_drawing_record *drawing_records;
+    int                drawing_record_count;
 } xs_schematic;
 
 int  xs_parse_schematic(const char *path, xs_schematic *out);
