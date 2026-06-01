@@ -42,6 +42,15 @@ typedef struct {
     int              lvs_mode;        /* prefer lvs_format and strip leading `#` from auto names */
     xs_library_path *library_path;
     xs_hash         *symbol_cache;    /* keyed by symref (`"sky130_fd_pr/nfet_01v8.sym"`) */
+    /* When an instance's symbol is `type=subcircuit`, we both emit the X-line
+     * at the call site AND queue the symbol's companion .sch path here so the
+     * enclosing emit pass can recurse into it and emit its `.subckt ... .ends`
+     * block. The set deduplicates by subckt name (cell_name of the nested
+     * schematic) and breaks cycles. */
+    xs_hash         *already_emitted_nested_subckt_names_set;
+    char           **pending_nested_subckt_schematic_paths;
+    int              pending_nested_subckt_count;
+    int              pending_nested_subckt_capacity;
 } xs_netlister;
 
 void xs_netlister_init(xs_netlister *nl, xs_library_path *lp, int lvs_mode);

@@ -34,6 +34,7 @@
 
 #include <ctype.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -232,17 +233,64 @@ static xs_symbol *load_companion_sym_for_schematic(xs_netlister *nl,
     return sym;
 }
 
+static void noop_value_free_for_set_used_as_marker_only(void *value_pointer) { (void)value_pointer; }
+
 void xs_netlister_init(xs_netlister *nl, xs_library_path *lp, int lvs_mode)
 {
     nl->lvs_mode     = lvs_mode;
     nl->library_path = lp;
     nl->symbol_cache = xs_hash_new(64);
+    nl->already_emitted_nested_subckt_names_set = xs_hash_new(16);
+    nl->pending_nested_subckt_schematic_paths   = NULL;
+    nl->pending_nested_subckt_count             = 0;
+    nl->pending_nested_subckt_capacity          = 0;
 }
 
 void xs_netlister_free(xs_netlister *nl)
 {
     if (nl->symbol_cache) xs_hash_free(nl->symbol_cache, free_cached_symbol);
     nl->symbol_cache = NULL;
+    if (nl->already_emitted_nested_subckt_names_set)
+        xs_hash_free(nl->already_emitted_nested_subckt_names_set,
+                     noop_value_free_for_set_used_as_marker_only);
+    nl->already_emitted_nested_subckt_names_set = NULL;
+    for (int i = 0; i < nl->pending_nested_subckt_count; i++)
+        free(nl->pending_nested_subckt_schematic_paths[i]);
+    free(nl->pending_nested_subckt_schematic_paths);
+    nl->pending_nested_subckt_schematic_paths = NULL;
+    nl->pending_nested_subckt_count    = 0;
+    nl->pending_nested_subckt_capacity = 0;
+}
+
+/* Derive `<dirname>/<basename>.sch` from a `<dirname>/<basename>.sym` path,
+ * returning NULL if the file doesn't exist or the input doesn't end in .sym.
+ * Caller frees the returned string. */
+static char *companion_sch_path_for_sym_path(const char *sym_path)
+{
+    if (!sym_path) return NULL;
+    size_t length = strlen(sym_path);
+    if (length < 4 || strcmp(sym_path + length - 4, ".sym") != 0) return NULL;
+    char *sch_path = xs_strdup(sym_path);
+    memcpy(sch_path + length - 4, ".sch", 4);
+    FILE *existence_probe = fopen(sch_path, "rb");
+    if (!existence_probe) { free(sch_path); return NULL; }
+    fclose(existence_probe);
+    return sch_path;
+}
+
+static void schedule_nested_subckt_schematic_for_emission(
+        xs_netlister *nl, const char *schematic_path)
+{
+    if (nl->pending_nested_subckt_count >= nl->pending_nested_subckt_capacity) {
+        int new_capacity = nl->pending_nested_subckt_capacity * 2;
+        if (new_capacity < 4) new_capacity = 4;
+        nl->pending_nested_subckt_schematic_paths = xs_xrealloc(
+                nl->pending_nested_subckt_schematic_paths,
+                sizeof(char *) * (size_t)new_capacity);
+        nl->pending_nested_subckt_capacity = new_capacity;
+    }
+    nl->pending_nested_subckt_schematic_paths[nl->pending_nested_subckt_count++] =
+            xs_strdup(schematic_path);
 }
 
 int xs_netlister_resolve_symbols(xs_netlister *nl, xs_schematic *sch)
@@ -775,6 +823,115 @@ static void build_subckt_port_list_from_self_sym(port_list *ports,
     }
 }
 
+/* Reserved single-@ tokens in xschem format strings that don't represent
+ * .subckt ports. `@symname` and `@model` additionally TERMINATE the port
+ * walk — anything after them in the format is the cell-name suffix, not
+ * a port. Mirrors print_spice_subckt_nodes() in xschem's src/token.c. */
+static int format_meta_token_is_reserved_and_not_a_port(const char *token_after_at)
+{
+    static const char *reserved[] = {
+        "name", "symname", "model", "spiceprefix",
+        "pinlist", "savecurrent", "path", "spice_ignore",
+        NULL,
+    };
+    for (int i = 0; reserved[i]; i++)
+        if (strcmp(token_after_at, reserved[i]) == 0) return 1;
+    return 0;
+}
+
+static int format_meta_token_terminates_port_list_walk(const char *token_after_at)
+{
+    return strcmp(token_after_at, "symname") == 0 ||
+           strcmp(token_after_at, "model")   == 0;
+}
+
+static const xs_symbol_pin *find_symbol_pin_by_name(
+        const xs_symbol *sym, const char *pin_name)
+{
+    if (!sym || !pin_name) return NULL;
+    for (int i = 0; i < sym->pin_count; i++) {
+        if (sym->pins[i].name && strcmp(sym->pins[i].name, pin_name) == 0)
+            return &sym->pins[i];
+    }
+    return NULL;
+}
+
+static char direction_kind_for_pin(const xs_symbol_pin *pin)
+{
+    if (!pin || !pin->dir) return 'B';
+    if (strcmp(pin->dir, "in")    == 0) return 'I';
+    if (strcmp(pin->dir, "out")   == 0) return 'O';
+    if (strcmp(pin->dir, "inout") == 0) return 'B';
+    return 'B';
+}
+
+/* Build the .subckt port list by walking the symbol's `format=` string in
+ * left-to-right order, mirroring xschem's print_spice_subckt_nodes():
+ *
+ *   @@PinName    -> port whose net is bound by the instance's pin slot
+ *   @PropName    -> "extra" port whose value comes from an instance property
+ *                   (e.g. @VGND / @VNB / @VPB / @VPWR for power rails that
+ *                   aren't part of the symbol's B-record pin set)
+ *   @name / @symname / @model / @spiceprefix / @pinlist / @savecurrent
+ *                -> meta tokens, not ports
+ *
+ * The walk stops at @symname or @model (everything after is the cell-name
+ * tail). The port list order matches the format-string order — this is the
+ * order the X-line emission also follows, so .subckt declaration and
+ * instance line agree pin-for-pin. */
+static void build_subckt_port_list_from_symbol_format_string(
+        port_list *ports, const xs_symbol *sym)
+{
+    if (!sym || !sym->format || !*sym->format) return;
+    const char *cursor = sym->format;
+    while (*cursor) {
+        if (*cursor != '@') { cursor++; continue; }
+
+        if (cursor[1] == '@' &&
+                (isalpha((unsigned char)cursor[2]) || cursor[2] == '_')) {
+            cursor += 2;
+            const char *token_start = cursor;
+            while (*cursor && (isalnum((unsigned char)*cursor) || *cursor == '_'
+                            || *cursor == '[' || *cursor == ']'
+                            || *cursor == ',' || *cursor == ':'
+                            || *cursor == '.'))
+                cursor++;
+            size_t token_length = (size_t)(cursor - token_start);
+            if (token_length == 0) continue;
+            char *pin_name_token = xs_strndup(token_start, token_length);
+            const xs_symbol_pin *pin = find_symbol_pin_by_name(sym, pin_name_token);
+            if (pin) {
+                port_list_add_unique_taking_ownership(
+                        ports, xs_strdup(pin->name), direction_kind_for_pin(pin));
+            }
+            free(pin_name_token);
+            continue;
+        }
+
+        if (cursor[1] && (isalpha((unsigned char)cursor[1]) || cursor[1] == '_')) {
+            cursor++;
+            const char *token_start = cursor;
+            while (*cursor && (isalnum((unsigned char)*cursor) || *cursor == '_'))
+                cursor++;
+            size_t token_length = (size_t)(cursor - token_start);
+            if (token_length == 0) continue;
+            char *property_token = xs_strndup(token_start, token_length);
+            if (format_meta_token_terminates_port_list_walk(property_token)) {
+                free(property_token);
+                break;
+            }
+            if (!format_meta_token_is_reserved_and_not_a_port(property_token)) {
+                port_list_add_unique_taking_ownership(
+                        ports, xs_strdup(property_token), 'B');
+            }
+            free(property_token);
+            continue;
+        }
+
+        cursor++;
+    }
+}
+
 static void build_subckt_port_list_from_schematic_ports(port_list *ports,
                                                         const xs_schematic *sch,
                                                         int lvs_mode)
@@ -801,6 +958,10 @@ static void build_subckt_port_list(port_list *ports, xs_netlister *nl,
                                    const xs_schematic *sch)
 {
     xs_symbol *self_sym = load_companion_sym_for_schematic(nl, sch);
+    if (self_sym && self_sym->format && *self_sym->format) {
+        build_subckt_port_list_from_symbol_format_string(ports, self_sym);
+        if (ports->count > 0) return;
+    }
     if (self_sym && self_sym->pin_count > 0)
         build_subckt_port_list_from_self_sym(ports, self_sym, sch, nl->lvs_mode);
     else
@@ -1084,7 +1245,7 @@ static void emit_bus_expanded_instance(FILE *out, const xs_instance *ins,
     free(resolved_pin_nets);
 }
 
-static void emit_one_device(FILE *out, const xs_instance *ins,
+static void emit_one_device(xs_netlister *nl, FILE *out, const xs_instance *ins,
                             const connectivity_graph *g,
                             const net_label_table *labels,
                             int instance_index, int lvs_mode)
@@ -1098,15 +1259,27 @@ static void emit_one_device(FILE *out, const xs_instance *ins,
     free(si);
     if (ignore) return;
 
-    /* type=subcircuit is replaced by `* IS MISSING !!!!` (we never recurse). */
+    /* type=subcircuit: emit the X-line via the normal format-substitution path
+     * below AND queue the companion .sch for recursive emission so its
+     * `.subckt ... .ends` block ends up in the same netlist. If we can't find
+     * a companion .sch (broken library setup, abstract symbol with no body),
+     * fall back to XSCHEM's `* IS MISSING !!!!` comment so the output still
+     * reflects the unresolved reference. */
     if (symbol_type_equals(sym->type, "subcircuit")) {
-        char *iname = xs_prop_get(ins->prop_block, "name");
-        char *sname = symref_basename_without_extension(ins->symref);
-        fprintf(out, "*  %s -  %s  IS MISSING !!!!\n",
-                iname ? iname : "?", sname ? sname : "?");
-        free(iname);
-        free(sname);
-        return;
+        char *companion_sch_path = companion_sch_path_for_sym_path(sym->path);
+        if (companion_sch_path) {
+            schedule_nested_subckt_schematic_for_emission(nl, companion_sch_path);
+            free(companion_sch_path);
+            /* fall through to normal emission below */
+        } else {
+            char *iname = xs_prop_get(ins->prop_block, "name");
+            char *sname = symref_basename_without_extension(ins->symref);
+            fprintf(out, "*  %s -  %s  IS MISSING !!!!\n",
+                    iname ? iname : "?", sname ? sname : "?");
+            free(iname);
+            free(sname);
+            return;
+        }
     }
 
     const char *format = select_emission_format(ins, lvs_mode);
@@ -1158,7 +1331,7 @@ static void emit_pininfo_line(FILE *out, const port_list *ports)
 /* type=netlist_commands instances (`.control`, `.MODEL`, …) are deferred
  * after the device list, matching XSCHEM's `**** begin user architecture
  * code` section ordering. */
-static void emit_devices(FILE *out, const xs_schematic *sch,
+static void emit_devices(xs_netlister *nl, FILE *out, const xs_schematic *sch,
                          const connectivity_graph *g,
                          const net_label_table *labels,
                          int lvs_mode)
@@ -1171,14 +1344,95 @@ static void emit_devices(FILE *out, const xs_schematic *sch,
             int is_netlist_cmd = symbol_type_equals(sym->type, "netlist_commands");
             if ((pass == 0 &&  is_netlist_cmd) ||
                 (pass == 1 && !is_netlist_cmd)) continue;
-            emit_one_device(out, ins, g, labels, i, lvs_mode);
+            emit_one_device(nl, out, ins, g, labels, i, lvs_mode);
         }
     }
 }
 
-static void emit_subckt_footer(FILE *out)
+static void emit_subckt_block_for_schematic(
+        xs_netlister *nl, FILE *out, const xs_schematic *sch);
+
+/* Drain the queue of pending nested .sch files. Each pop parses the .sch,
+ * resolves its symbols via the shared cache on `nl`, and emits its
+ * `.subckt ... .ends` block. Emitting may push more entries onto the queue
+ * if the nested schematic itself references type=subcircuit symbols; we
+ * loop until the queue empties. Already-emitted subckts (by name) are
+ * skipped, which also breaks any recursive cycle in the symbol graph. */
+static void drain_pending_nested_subckts(xs_netlister *nl, FILE *out)
 {
-    fputs(".ends\n.end\n", out);
+    while (nl->pending_nested_subckt_count > 0) {
+        char *one_pending_sch_path = nl->pending_nested_subckt_schematic_paths[
+                --nl->pending_nested_subckt_count];
+
+        xs_schematic nested_schematic;
+        memset(&nested_schematic, 0, sizeof nested_schematic);
+        if (xs_parse_schematic(one_pending_sch_path, &nested_schematic) != 0) {
+            fprintf(stderr,
+                    "xschem2spice: warning: failed to parse nested schematic '%s', skipping\n",
+                    one_pending_sch_path);
+            free(one_pending_sch_path);
+            continue;
+        }
+        free(one_pending_sch_path);
+
+        if (nested_schematic.cell_name &&
+                xs_hash_get(nl->already_emitted_nested_subckt_names_set,
+                            nested_schematic.cell_name)) {
+            xs_free_schematic(&nested_schematic);
+            continue;
+        }
+
+        if (xs_netlister_resolve_symbols(nl, &nested_schematic) != 0) {
+            fprintf(stderr,
+                    "xschem2spice: warning: failed to resolve symbols in nested schematic '%s'\n",
+                    nested_schematic.path ? nested_schematic.path : "?");
+            xs_free_schematic(&nested_schematic);
+            continue;
+        }
+
+        if (nested_schematic.cell_name)
+            xs_hash_put(nl->already_emitted_nested_subckt_names_set,
+                        nested_schematic.cell_name,
+                        (void *)(intptr_t)1);
+
+        fputc('\n', out);
+        emit_subckt_block_for_schematic(nl, out, &nested_schematic);
+
+        xs_free_schematic(&nested_schematic);
+    }
+}
+
+/* Emits the `.subckt ... .ends` block (header + pininfo + devices + footer)
+ * for a single resolved schematic. Shared between the top-level pass and the
+ * pending-nested drain loop. The port list comes from the schematic's own
+ * ipin/opin/iopin labels (xschem's authoritative convention for .subckt
+ * interfaces); the companion .sym's B-records are only used for visual pin
+ * placement and per-instance pin binding, not for the .subckt header. Does
+ * NOT emit `.end`. */
+static void emit_subckt_block_for_schematic(
+        xs_netlister *nl, FILE *out, const xs_schematic *sch)
+{
+    connectivity_graph graph;
+    build_connectivity_graph(&graph, sch);
+
+    net_label_table labels;
+    net_label_table_init(&labels, graph.net_count);
+    apply_instance_label_pins(&labels, &graph, sch, nl->lvs_mode);
+    apply_bus_taps           (&labels, &graph, sch);
+    apply_auto_names_to_used_unlabeled_nets(&labels, &graph, sch);
+
+    port_list ports;
+    port_list_init(&ports);
+    build_subckt_port_list(&ports, nl, sch);
+
+    emit_subckt_header(out, sch, &ports);
+    emit_pininfo_line (out, &ports);
+    emit_devices      (nl, out, sch, &graph, &labels, nl->lvs_mode);
+    fputs(".ends\n", out);
+
+    port_list_free(&ports);
+    net_label_table_free(&labels);
+    free_connectivity_graph(&graph);
 }
 
 /* ============================================================ *
@@ -1195,27 +1449,15 @@ int xs_netlister_emit_spice(xs_netlister *nl, const xs_schematic *sch, FILE *out
         }
     }
 
-    connectivity_graph graph;
-    build_connectivity_graph(&graph, sch);
+    if (sch->cell_name)
+        xs_hash_put(nl->already_emitted_nested_subckt_names_set,
+                    sch->cell_name,
+                    (void *)(intptr_t)1);
 
-    net_label_table labels;
-    net_label_table_init(&labels, graph.net_count);
-    apply_instance_label_pins(&labels, &graph, sch, nl->lvs_mode);
-    apply_bus_taps           (&labels, &graph, sch);
-    apply_auto_names_to_used_unlabeled_nets(&labels, &graph, sch);
+    emit_subckt_block_for_schematic(nl, out, sch);
+    drain_pending_nested_subckts(nl, out);
 
-    port_list ports;
-    port_list_init(&ports);
-    build_subckt_port_list(&ports, nl, sch);
-
-    emit_subckt_header(out, sch, &ports);
-    emit_pininfo_line (out, &ports);
-    emit_devices      (out, sch, &graph, &labels, nl->lvs_mode);
-    emit_subckt_footer(out);
-
-    port_list_free(&ports);
-    net_label_table_free(&labels);
-    free_connectivity_graph(&graph);
+    fputs(".end\n", out);
     return 0;
 }
 
