@@ -382,6 +382,67 @@ static int read_drawing_record_for_tag(parse_cursor *p, char tag,
 
 /* ---------------- schematic parsing ---------------- */
 
+/* Returns 1 if `label` matches the xschem bus syntax: NAME[MSB:LSB],
+   NAME[MSB..LSB], or any comma-separated list of names. Mirrors the
+   regex in xschem's src/netlist.c auto_set_wire_bus(): the bracketed
+   form needs both a `[` and `]` with `:` or `..` between them. */
+static int label_value_has_bus_form(const char *label)
+{
+    if (!label || !*label) return 0;
+    const char *left_bracket  = strchr(label, '[');
+    if (left_bracket) {
+        const char *right_bracket = strchr(left_bracket + 1, ']');
+        if (right_bracket && right_bracket > left_bracket + 1) {
+            for (const char *p = left_bracket + 1; p + 1 <= right_bracket; ++p) {
+                if (*p == ':') return 1;
+                if (p + 1 < right_bracket && p[0] == '.' && p[1] == '.') return 1;
+            }
+        }
+    }
+    if (strchr(label, ',')) return 1;
+    return 0;
+}
+
+/* Case-insensitive equality of two NUL-terminated ASCII strings. Hand-rolled
+   instead of strcasecmp so MSVC builds (its <strings.h> is POSIX-only). */
+static int ascii_strings_equal_ignoring_case(const char *a, const char *b)
+{
+    while (*a && *b) {
+        int low_a = tolower((unsigned char)*a);
+        int low_b = tolower((unsigned char)*b);
+        if (low_a != low_b) return 0;
+        ++a; ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* Returns 1 if the wire's prop block requests bus treatment, either
+   explicitly via `bus=1`/`bus=true`/`bus=yes` (case-insensitive) or
+   implicitly via a bus-form `lab=` value. xschem persists the auto-
+   detected bit into `bus=1` itself; either source is honored. */
+static int wire_property_block_indicates_bus(const char *prop_block)
+{
+    if (!prop_block) return 0;
+    char *explicit_bus_value = xs_prop_get(prop_block, "bus");
+    if (explicit_bus_value) {
+        int explicit_is_truthy = 0;
+        if (!(explicit_bus_value[0] == '\0' ||
+              ascii_strings_equal_ignoring_case(explicit_bus_value, "0") ||
+              ascii_strings_equal_ignoring_case(explicit_bus_value, "false") ||
+              ascii_strings_equal_ignoring_case(explicit_bus_value, "no") ||
+              ascii_strings_equal_ignoring_case(explicit_bus_value, "n"))) {
+            explicit_is_truthy = 1;
+        }
+        free(explicit_bus_value);
+        if (explicit_is_truthy) return 1;
+    }
+    char *label_value = xs_prop_get(prop_block, "lab");
+    if (!label_value) return 0;
+    int auto_detected = label_value_has_bus_form(label_value);
+    free(label_value);
+    return auto_detected;
+}
+
 static void schematic_append_wire(xs_schematic *s, xs_wire wire)
 {
     s->wires = xs_xrealloc(s->wires, sizeof(xs_wire) * (size_t)(s->wire_count + 1));
@@ -426,6 +487,7 @@ static int parse_schematic_buffer(const char *buf, size_t length,
                 return -1;
             }
             w.prop_block = read_brace_block(&p);
+            w.is_bus = wire_property_block_indicates_bus(w.prop_block);
             schematic_append_wire(out, w);
             break;
         }

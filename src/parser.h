@@ -105,6 +105,10 @@ typedef struct {
 typedef struct {
     double x1, y1, x2, y2;
     char  *prop_block;            /* raw `{...}` from the N-record */
+    int    is_bus;                /* 1 if the wire carries a bus (label has [MSB:LSB]
+                                     or [MSB..LSB] form, contains a comma, or the
+                                     prop block has bus=1/true/yes). Mirrors xschem's
+                                     auto_set_wire_bus() detection in src/netlist.c. */
 } xs_wire;
 
 typedef struct {
