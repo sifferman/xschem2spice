@@ -96,6 +96,16 @@ typedef struct {
     char              *template_;     /* K-block template= raw string, possibly NULL */
     char              *extra;         /* K-block extra= (manual subckt port list), possibly NULL */
     char              *spice_ignore;  /* K-block spice_ignore=, possibly NULL */
+    char              *default_schematic; /* K-block default_schematic=, possibly NULL.
+                                          * When set to "ignore", xschem2spice will NOT
+                                          * try to find/recurse a companion .sch and
+                                          * will NOT emit the `* IS MISSING` placeholder
+                                          * line when one is absent. Mirrors xschem's
+                                          * `default_schematic=ignore` symbol property
+                                          * used to flag symbols whose .subckt body
+                                          * comes from outside (a `.include`'d PDK lib,
+                                          * a separately-generated synthesis result,
+                                          * or any other externally-provided source). */
     xs_symbol_pin     *pins;
     int                pin_count;
     xs_drawing_record *drawing_records;
