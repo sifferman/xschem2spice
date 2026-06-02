@@ -1262,15 +1262,25 @@ static void emit_one_device(xs_netlister *nl, FILE *out, const xs_instance *ins,
     /* type=subcircuit: emit the X-line via the normal format-substitution path
      * below AND queue the companion .sch for recursive emission so its
      * `.subckt ... .ends` block ends up in the same netlist. If we can't find
-     * a companion .sch (broken library setup, abstract symbol with no body),
-     * fall back to XSCHEM's `* IS MISSING !!!!` comment so the output still
-     * reflects the unresolved reference. */
+     * a companion .sch, fall back to XSCHEM's `* IS MISSING !!!!` comment so
+     * the output still reflects the unresolved reference -- UNLESS the symbol
+     * carries XSCHEM's `default_schematic=ignore` K-block property, in which
+     * case the missing .sch is the *intended* state (the .subckt body is
+     * supplied externally, e.g. from a `.include`d PDK stdcell library or a
+     * separately-loaded synthesis result) and we silently fall through to
+     * X-line emission. Upstream precedent at xschem 3.4.7:
+     * spice_block_netlist() returns early on default_schematic=ignore
+     *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/spice_netlist.c#L637-L640
+     * get_additional_symbols() sets ignore_schematic from the same prop
+     *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/actions.c#L2080-L2081 */
     if (symbol_type_equals(sym->type, "subcircuit")) {
         char *companion_sch_path = companion_sch_path_for_sym_path(sym->path);
         if (companion_sch_path) {
             schedule_nested_subckt_schematic_for_emission(nl, companion_sch_path);
             free(companion_sch_path);
-            /* fall through to normal emission below */
+        } else if (sym->default_schematic
+                && strcmp(sym->default_schematic, "ignore") == 0) {
+            /* author explicitly opted out of .sch recursion for this symbol */
         } else {
             char *iname = xs_prop_get(ins->prop_block, "name");
             char *sname = symref_basename_without_extension(ins->symref);

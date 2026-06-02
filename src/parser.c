@@ -618,12 +618,13 @@ static void absorb_kg_block_into_symbol(xs_symbol *sym, const char *kprops)
 {
     #define ABSORB_FIELD(field, key) \
         do { if (!sym->field) sym->field = xs_prop_get(kprops, key); } while (0)
-    ABSORB_FIELD(type,         "type");
-    ABSORB_FIELD(format,       "format");
-    ABSORB_FIELD(lvs_format,   "lvs_format");
-    ABSORB_FIELD(template_,    "template");
-    ABSORB_FIELD(extra,        "extra");
-    ABSORB_FIELD(spice_ignore, "spice_ignore");
+    ABSORB_FIELD(type,              "type");
+    ABSORB_FIELD(format,            "format");
+    ABSORB_FIELD(lvs_format,        "lvs_format");
+    ABSORB_FIELD(template_,         "template");
+    ABSORB_FIELD(extra,             "extra");
+    ABSORB_FIELD(spice_ignore,      "spice_ignore");
+    ABSORB_FIELD(default_schematic, "default_schematic");
     #undef ABSORB_FIELD
 }
 
@@ -754,6 +755,7 @@ void xs_free_symbol(xs_symbol *s)
     free(s->template_);
     free(s->extra);
     free(s->spice_ignore);
+    free(s->default_schematic);
     free_drawing_record_array(s->drawing_records, s->drawing_record_count);
     memset(s, 0, sizeof *s);
 }
