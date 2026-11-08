@@ -24,9 +24,14 @@ WASM_SMOKE_GOLDEN    = wasm-smoke/diode_1.golden.spice
 WASM_SMOKE_OUTPUT    = wasm-smoke/diode_1.out.spice
 WASM_SMOKE_XSCHEMRC  = wasm-smoke/xschemrc
 
-.PHONY: summary clean init wasm-smoke
+ESCAPED_TEMPLATE_XSCHEMRC  = escaped-template/xschemrc
+ESCAPED_TEMPLATE_SCHEMATIC = escaped-template/escaped_template.sch
+ESCAPED_TEMPLATE_GOLDEN    = escaped-template/escaped_template.golden.spice
+ESCAPED_TEMPLATE_OUTPUT    = escaped-template/escaped_template.out.spice
 
-summary: $(REPORTS)
+.PHONY: summary clean init wasm-smoke escaped-template
+
+summary: escaped-template $(REPORTS)
 	@for ext in report failed xfail xpass skipped; do \
 	   printf "  %-8s %d\n" "$$ext" "$$(find $(REPORT_DIR) -name "*.$$ext" 2>/dev/null | wc -l)"; \
 	 done
@@ -48,6 +53,15 @@ wasm-smoke: $(WASM_SMOKE_BINARY)
 	diff -u $(WASM_SMOKE_GOLDEN) $(WASM_SMOKE_OUTPUT)
 	@echo "WASM smoke test passed."
 
+# Golden from real xschem 3.4.7: a template value written as \\"'expr'\\" in a
+# .sym brace block must survive both unescape layers (load_ascii_string, then
+# get_tok_value) and must not truncate the template keys that follow it.
+escaped-template: $(ROOT)/xschem2spice
+	$(ROOT)/xschem2spice --xschemrc $(ESCAPED_TEMPLATE_XSCHEMRC) $(ESCAPED_TEMPLATE_SCHEMATIC) \
+	    | grep -v '^\*\* sch_path:' > $(ESCAPED_TEMPLATE_OUTPUT)
+	diff -u $(ESCAPED_TEMPLATE_GOLDEN) $(ESCAPED_TEMPLATE_OUTPUT)
+	@echo "Escaped-template test passed."
+
 $(ROOT)/xschem2spice:
 	$(MAKE) -C $(ROOT)
 
@@ -58,4 +72,4 @@ init:
 	cd $(ROOT) && git submodule update --init --recursive
 
 clean:
-	rm -rf $(REPORT_DIR) $(WASM_SMOKE_OUTPUT)
+	rm -rf $(REPORT_DIR) $(WASM_SMOKE_OUTPUT) $(ESCAPED_TEMPLATE_OUTPUT)

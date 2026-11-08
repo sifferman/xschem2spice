@@ -1,0 +1,4 @@
+# Paths are relative to test/, where the escaped-template target runs.
+set XSCHEM_LIBRARY_PATH {}
+append XSCHEM_LIBRARY_PATH :schematics/xschem/xschem_library/devices
+append XSCHEM_LIBRARY_PATH :escaped-template

@@ -1,0 +1,6 @@
+.subckt escaped_template
+*.PININFO
+XM1 D G S VSS escaped_template_model L=0.60u W=1.2u
++ ad='int((nf+1)/2) * W/nf * 0.18u' as='int((nf+2)/2) * W/nf * 0.18u' m=1
+.ends
+.end

@@ -113,29 +113,40 @@ static int read_required_integer_token(parse_cursor *p, int *out)
 /* Read a `{...}` block. Brace balance is honoured; `\\` escapes the next
  * character (so `\}` doesn't close the block). Returns a malloc'd copy of
  * the block contents (without outer braces) or NULL on syntax error. */
+/*
+ * Mirrors load_ascii_string() in xschem
+ *   https://github.com/StefanSchippers/xschem/blob/3.4.7/src/save.c#L3204-L3242
+ * A backslash makes the next character literal and is itself dropped, so
+ * `\\"` in a .sym file reaches get_tok_value() as `\"` (an escaped quote).
+ */
 static char *read_brace_block(parse_cursor *p)
 {
     skip_whitespace(p);
     if (cursor_eof(p) || *p->cursor != '{') return NULL;
     p->cursor++;
-    const char *start = p->cursor;
+    xs_string_buffer contents;
+    xs_string_buffer_init(&contents);
     int depth = 1;
-    while (p->cursor < p->end && depth > 0) {
+    while (p->cursor < p->end) {
         char c = *p->cursor;
         if (c == '\\' && p->cursor + 1 < p->end) {
             if (p->cursor[1] == '\n') p->line_number++;
+            xs_string_buffer_append_char(&contents, p->cursor[1]);
             p->cursor += 2;
             continue;
         }
         if (c == '{') depth++;
         else if (c == '}') { depth--; if (depth == 0) break; }
         else if (c == '\n') p->line_number++;
+        xs_string_buffer_append_char(&contents, c);
         p->cursor++;
     }
-    if (depth != 0) return NULL;
-    char *contents = xs_strndup(start, (size_t)(p->cursor - start));
+    if (depth != 0) {
+        xs_string_buffer_free(&contents);
+        return NULL;
+    }
     p->cursor++;
-    return contents;
+    return contents.buffer ? contents.buffer : xs_strdup("");
 }
 
 static int skip_brace_block(parse_cursor *p)
